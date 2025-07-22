@@ -58,6 +58,7 @@ except ImportError:
 
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
+import numpy as np
 
 # ────────────────────────────────────────────────────────────────────────────────
 # 0. CONFIGURATION
@@ -71,7 +72,7 @@ CONFIG = {
     "TUNE_PCT": 0.2,
     # Remaining 20 % is automatically the lock‑box.
     # Symbols & intervals
-    "SYMBOLS": ["SOLUSDT", "PAXGUSDT"],
+    "SYMBOLS": ["BTCUSDT", "ETHUSDT", "ADAUSDT", "DOGEUSDT", "SOLUSDT", "PAXGUSDT"],
     "INTERVALS": ["1s", "1m", "5m", "1h", "4h", "1d"],
     # Candle cap
     "MAX_BARS": 20_000,
@@ -288,6 +289,8 @@ def orchestrate():
         ]
         fig, ax = plt.subplots()
         fig.suptitle("Average Robustness & Lockbox Scores Across All Symbol/Intervals")
+        fig_table, ax_table = plt.subplots(figsize=(8, 8))
+        fig_table.suptitle("Best Combination for Each Timeframe (+/-95% CI)")
         report_file = Path("walk_forward_report.csv")
         if report_file.exists():
             full_history = pd.read_csv(report_file)
@@ -396,7 +399,7 @@ def orchestrate():
                 "lockbox_youden_j", "lockbox_calmar", "lockbox_max_dd"
             ]
             delta_cols = [c + "_delta" for c in cols[3:]]
-            table = []
+            table_rows = []
             for _, row in df_res.iterrows():
                 key = (row["symbol"], row["interval"])
                 prev = prev_rows.get(key, {})
@@ -413,7 +416,7 @@ def orchestrate():
                             row_out.append("N/A")
                     else:
                         row_out.append("N/A")
-                table.append(row_out)
+                table_rows.append(row_out)
                 # Save for next iteration
                 prev_rows[key] = {c: row.get(c, None) for c in cols}
                 # --- Update plot data ---
@@ -452,6 +455,46 @@ def orchestrate():
                 ax.yaxis.set_major_formatter(mticker.PercentFormatter())
                 # Force x-axis to show only integer ticks
                 ax.xaxis.set_major_locator(mticker.MaxNLocator(integer=True))
+
+                # --- Table of best combos for each timeframe with 95% CI (separate window) ---
+                ax_table.clear()
+                table_data = []
+                table_cols = ["Symbol", "Interval", "Best Periods", "Robustness", "YoudenJ (mean±CI)", "Calmar (mean±CI)", "MaxDD (mean±CI)"]
+                for (symbol, interval) in sorted(set(zip(full_history['symbol'], full_history['interval']))):
+                    pair_rows = full_history[(full_history['symbol'] == symbol) & (full_history['interval'] == interval)]
+                    if pair_rows.empty:
+                        continue
+                    best_row = pair_rows.loc[pair_rows['robustness_score'].idxmax()]
+                    def mean_ci(series):
+                        vals = series.dropna().astype(float)
+                        if len(vals) == 0:
+                            return (np.nan, np.nan)
+                        mean = np.mean(vals)
+                        se = np.std(vals, ddof=1) / np.sqrt(len(vals)) if len(vals) > 1 else 0
+                        ci = 1.96 * se
+                        return mean, ci
+                    yj_mean, yj_ci = mean_ci(pair_rows['tuning_youden_j'])
+                    calmar_mean, calmar_ci = mean_ci(pair_rows['tuning_calmar'])
+                    maxdd_mean, maxdd_ci = mean_ci(pair_rows['tuning_max_dd'] if 'tuning_max_dd' in pair_rows else pair_rows['tuning_max_drawdown'])
+                    table_data.append([
+                        symbol,
+                        interval,
+                        best_row['periods'],
+                        f"{best_row['robustness_score']:.3f}",
+                        f"{yj_mean:.3f}±{yj_ci:.3f}",
+                        f"{calmar_mean:.3f}±{calmar_ci:.3f}",
+                        f"{maxdd_mean:.3f}±{maxdd_ci:.3f}"
+                    ])
+                ax_table.axis('off')
+                table = ax_table.table(cellText=table_data, colLabels=table_cols, loc='center', cellLoc='center')
+                table.auto_set_font_size(False)
+                table.set_fontsize(10)
+                table.scale(1.2, 1.2)
+                fig_table.tight_layout(rect=[0, 0, 1, 0.97])
+                fig_table.canvas.draw()
+                fig_table.canvas.flush_events()
+
+                fig.tight_layout(rect=[0, 0, 1, 0.97])
                 fig.canvas.draw()
                 fig.canvas.flush_events()
             print(f"[Iteration {iteration}] Press Ctrl+C to stop or wait for next refinement...\n")
