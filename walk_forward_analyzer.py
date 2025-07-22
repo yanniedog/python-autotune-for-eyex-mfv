@@ -89,7 +89,6 @@ def calculate_final_metrics(all_returns, num_total_bars, interval):
         'num_trades': len(returns_np)
     }
 
-# NEW: Helper function for parallel combination analysis
 def _analyze_single_combination(combo, df_train, config, mf_volume_train):
     """Analyzes a single MFV combination to find its best horizon."""
     best_j_for_combo = -np.inf
@@ -128,8 +127,7 @@ def run_optimization_on_fold(df_train, interval, config):
     mf_volume = mf_multiplier * volume
     scan_results = []
     
-    # Added tqdm for real-time progress
-    for period in tqdm(range(start, end + 1, step), desc="  Broad Scan", file=sys.stderr, ncols=100):
+    for period in tqdm(range(start, end + 1, step), desc="  Broad Scan", file=sys.stderr, ncols=100, leave=False):
         if len(df_train) < period * 2: continue
         cum_mfv = mf_volume.rolling(window=period).sum()
         mean = cum_mfv.rolling(window=period).mean(); stdev = cum_mfv.rolling(window=period).std().replace(0, 1)
@@ -158,19 +156,26 @@ def run_optimization_on_fold(df_train, interval, config):
 
     peak_combinations = list(combinations([p['period'] for p in diverse_peaks], config['COMBINATION_SIZE']))
     
-    # --- NEW: Parallelized Combination Analysis ---
     best_combo_for_fold = None
     best_j_for_fold = -np.inf
     
     with ProcessPoolExecutor() as executor:
         futures = {executor.submit(_analyze_single_combination, combo, df_train, config, mf_volume): combo for combo in peak_combinations}
         
-        # Added tqdm for real-time progress on parallel tasks
-        for future in tqdm(as_completed(futures), total=len(futures), desc="  Combinations", file=sys.stderr, ncols=100):
+        # FIX: Added a secondary logging mechanism for robust progress updates.
+        completed_count = 0
+        total_futures = len(futures)
+        log_interval = max(1, total_futures // 10) # Log progress every 10%
+
+        for future in tqdm(as_completed(futures), total=total_futures, desc="  Combinations", file=sys.stderr, ncols=100, leave=False):
             result = future.result()
             if result and result['youdens_j'] > best_j_for_fold:
                 best_j_for_fold = result['youdens_j']
                 best_combo_for_fold = result
+            
+            completed_count += 1
+            if completed_count % log_interval == 0 and completed_count < total_futures:
+                logging.info(f"    Combination progress: {completed_count}/{total_futures} ({completed_count/total_futures:.0%})")
 
     return best_combo_for_fold
 
