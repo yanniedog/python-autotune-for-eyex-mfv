@@ -6,6 +6,7 @@ import json
 import logging
 import subprocess
 import pandas as pd
+import numpy as np # FIX: Added missing numpy import
 import requests
 from tenacity import retry, stop_after_attempt, wait_exponential
 from tqdm import tqdm
@@ -120,7 +121,7 @@ def display_comprehensive_report(all_results_df):
 def main():
     parser = argparse.ArgumentParser(description="Orchestrator for Walk-Forward MFV Analysis.")
     parser.add_argument(
-        'mode', default='comprehensive', choices=['comprehensive'],
+        'mode', nargs='?', default='comprehensive', choices=['comprehensive'],
         help="Mode of operation."
     )
     args = parser.parse_args()
@@ -150,13 +151,14 @@ def main():
                     command = [sys.executable, analyzer_script_path, temp_data_path, symbol, interval]
                     result = subprocess.run(
                         command,
-                        capture_output=True,
+                        stdout=subprocess.PIPE,
+                        stderr=sys.stderr, # This line streams the analyzer's progress to the console
                         text=True,
                         check=True,
                         timeout=CONFIG['ANALYSIS_TIMEOUT_SECONDS']
                     )
                     
-                    # 3. Parse the JSON result from the subprocess
+                    # 3. Parse the JSON result from the captured stdout
                     output = json.loads(result.stdout)
                     if output.get("status") == "success":
                         all_run_results.append(output['data'])
@@ -166,10 +168,9 @@ def main():
                 except subprocess.TimeoutExpired:
                     logging.error(f"Analysis for {symbol}/{interval} timed out after {CONFIG['ANALYSIS_TIMEOUT_SECONDS']} seconds. Skipping.")
                 except subprocess.CalledProcessError as e:
-                    logging.error(f"Error executing analyzer for {symbol}/{interval}:")
-                    logging.error(e.stderr)
+                    logging.error(f"Error executing analyzer for {symbol}/{interval}. Check console for details.")
                 except json.JSONDecodeError:
-                    logging.error(f"Could not decode JSON from analyzer for {symbol}/{interval}.")
+                    logging.error(f"Could not decode JSON from analyzer for {symbol}/{interval}. It might have timed out or failed.")
                 finally:
                     # 4. Clean up the temporary file
                     if os.path.exists(temp_data_path):

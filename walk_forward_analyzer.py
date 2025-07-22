@@ -12,15 +12,13 @@ from numba import jit
 # ==============================================================================
 # --- ADAPTIVE CONFIGURATION (FOR SPEED) ---
 # ==============================================================================
-# This is crucial to meet the 2-minute timeout for high-frequency data.
 def get_config_for_interval(interval_str):
     base_config = {
         'FINAL_PEAK_COUNT': 12, 'COMBINATION_SIZE': 4,
         'STOP_LOSS_PCT': 5.0, 'TAKE_PROFIT_PCT': 15.0,
         'MIN_PEAK_DISTANCE': 50,
-        # Walk-Forward Parameters
-        'NUM_FOLDS': 5, # Number of walk-forward steps
-        'TRAIN_TEST_RATIO': 3 # Train on 3 parts, test on 1 part
+        'NUM_FOLDS': 5,
+        'TRAIN_TEST_RATIO': 3
     }
     if 's' in interval_str:
         base_config.update({'BROAD_SCAN_START': 10, 'BROAD_SCAN_END': 1200, 'BROAD_SCAN_STEP': 10})
@@ -33,7 +31,6 @@ def get_config_for_interval(interval_str):
 # ==============================================================================
 # --- LOGGING ---
 # ==============================================================================
-# Note: This script's logs will be captured by the orchestrator's stderr.
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', stream=sys.stderr)
 
 # ==============================================================================
@@ -85,8 +82,6 @@ def calculate_final_metrics(all_returns, num_total_bars, interval):
     annualized_return = (total_return / num_years) if num_years > 0 else 0
     calmar_ratio = annualized_return / max_drawdown_pct if max_drawdown_pct > 0 else np.inf
 
-    # Youden's J isn't calculated on the aggregate, as it's a training metric.
-    # We can use an average of the IS Youden's J if needed, but for now we focus on OOS performance.
     return {
         'win_rate': win_rate,
         'max_drawdown_pct': max_drawdown_pct,
@@ -94,15 +89,47 @@ def calculate_final_metrics(all_returns, num_total_bars, interval):
         'num_trades': len(returns_np)
     }
 
+# NEW: Helper function for parallel combination analysis
+def _analyze_single_combination(combo, df_train, config, mf_volume_train):
+    """Analyzes a single MFV combination to find its best horizon."""
+    best_j_for_combo = -np.inf
+    best_result_for_combo = None
+
+    def normalize_zscore(data, window):
+        mean = data.rolling(window=window).mean(); stdev = data.rolling(window=window).std().replace(0, np.nan)
+        return ((data - mean) / stdev).fillna(0)
+    
+    mfv_lines = [(normalize_zscore(mf_volume_train.rolling(window=r).sum(), r) * 10).clip(-100, 100) for r in combo]
+    composite_signal = pd.concat(mfv_lines, axis=1).mean(axis=1)
+    
+    min_horizon, max_horizon = min(combo), int(max(combo) * 1.2)
+    for horizon in range(min_horizon, max_horizon + 1, config['BROAD_SCAN_STEP']):
+        if len(df_train) < horizon + max(combo): continue
+        
+        price_roc = df_train['close'].pct_change(periods=horizon).shift(-horizon) * 100
+        combined = pd.DataFrame({'signal': composite_signal, 'roc': price_roc}).dropna()
+        signal_sign, roc_sign = np.sign(combined['signal']), np.sign(combined['roc'])
+        tp = np.sum((signal_sign > 0) & (roc_sign > 0)); fn = np.sum((signal_sign <= 0) & (roc_sign > 0))
+        tn = np.sum((signal_sign < 0) & (roc_sign < 0)); fp = np.sum((signal_sign >= 0) & (roc_sign < 0))
+        sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0; specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
+        youdens_j = sensitivity + specificity - 1
+
+        if youdens_j > best_j_for_combo:
+            best_j_for_combo = youdens_j
+            best_result_for_combo = {'combination': combo, 'horizon': horizon, 'youdens_j': youdens_j}
+    
+    return best_result_for_combo
+
 def run_optimization_on_fold(df_train, interval, config):
     """This function runs the full optimization on a single training fold."""
-    # 1. Broad Scan
     start, end, step = config['BROAD_SCAN_START'], config['BROAD_SCAN_END'], config['BROAD_SCAN_STEP']
     close, high, low, volume = df_train['close'], df_train['high'], df_train['low'], df_train['volume']
     mf_multiplier = ((close - low) - (high - close)) / (high - low).replace(0, np.nan); mf_multiplier.fillna(0, inplace=True)
     mf_volume = mf_multiplier * volume
     scan_results = []
-    for period in range(start, end + 1, step):
+    
+    # Added tqdm for real-time progress
+    for period in tqdm(range(start, end + 1, step), desc="  Broad Scan", file=sys.stderr, ncols=100):
         if len(df_train) < period * 2: continue
         cum_mfv = mf_volume.rolling(window=period).sum()
         mean = cum_mfv.rolling(window=period).mean(); stdev = cum_mfv.rolling(window=period).std().replace(0, 1)
@@ -118,7 +145,6 @@ def run_optimization_on_fold(df_train, interval, config):
 
     if not scan_results: return None
 
-    # 2. Peak Selection
     sorted_by_j = sorted(scan_results, key=lambda x: x['youdens_j'], reverse=True)
     diverse_peaks = []
     if sorted_by_j:
@@ -130,34 +156,21 @@ def run_optimization_on_fold(df_train, interval, config):
     
     if len(diverse_peaks) < config['COMBINATION_SIZE']: return None
 
-    # 3. Combination Analysis
     peak_combinations = list(combinations([p['period'] for p in diverse_peaks], config['COMBINATION_SIZE']))
+    
+    # --- NEW: Parallelized Combination Analysis ---
     best_combo_for_fold = None
     best_j_for_fold = -np.inf
-
-    for combo in peak_combinations:
-        mf_volume_train = (((df_train['close'] - df_train['low']) - (df_train['high'] - df_train['close'])) / (df_train['high'] - df_train['low']).replace(0, np.nan)).fillna(0) * df_train['volume']
-        def normalize_zscore(data, window):
-            mean = data.rolling(window=window).mean(); stdev = data.rolling(window=window).std().replace(0, np.nan)
-            return ((data - mean) / stdev).fillna(0)
-        mfv_lines = [(normalize_zscore(mf_volume_train.rolling(window=r).sum(), r) * 10).clip(-100, 100) for r in combo]
-        composite_signal = pd.concat(mfv_lines, axis=1).mean(axis=1)
+    
+    with ProcessPoolExecutor() as executor:
+        futures = {executor.submit(_analyze_single_combination, combo, df_train, config, mf_volume): combo for combo in peak_combinations}
         
-        min_horizon, max_horizon = min(combo), int(max(combo) * 1.2)
-        for horizon in range(min_horizon, max_horizon + 1, config['BROAD_SCAN_STEP']):
-            if len(df_train) < horizon + max(combo): continue
-            
-            price_roc = df_train['close'].pct_change(periods=horizon).shift(-horizon) * 100
-            combined = pd.DataFrame({'signal': composite_signal, 'roc': price_roc}).dropna()
-            signal_sign, roc_sign = np.sign(combined['signal']), np.sign(combined['roc'])
-            tp = np.sum((signal_sign > 0) & (roc_sign > 0)); fn = np.sum((signal_sign <= 0) & (roc_sign > 0))
-            tn = np.sum((signal_sign < 0) & (roc_sign < 0)); fp = np.sum((signal_sign >= 0) & (roc_sign < 0))
-            sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0; specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
-            youdens_j = sensitivity + specificity - 1
-
-            if youdens_j > best_j_for_fold:
-                best_j_for_fold = youdens_j
-                best_combo_for_fold = {'combination': combo, 'horizon': horizon, 'youdens_j': youdens_j}
+        # Added tqdm for real-time progress on parallel tasks
+        for future in tqdm(as_completed(futures), total=len(futures), desc="  Combinations", file=sys.stderr, ncols=100):
+            result = future.result()
+            if result and result['youdens_j'] > best_j_for_fold:
+                best_j_for_fold = result['youdens_j']
+                best_combo_for_fold = result
 
     return best_combo_for_fold
 
@@ -186,7 +199,6 @@ def run_walk_forward(data_path, symbol, interval):
             df_train = df.iloc[start_idx:train_end_idx].copy()
             df_test = df.iloc[train_end_idx:test_end_idx].copy()
 
-            # Find best parameters on the training fold
             best_params = run_optimization_on_fold(df_train, interval, config)
             if not best_params:
                 logging.warning(f"No valid parameters found for fold {i+1}.")
@@ -194,7 +206,6 @@ def run_walk_forward(data_path, symbol, interval):
             
             best_params_per_fold.append(best_params)
 
-            # Apply best parameters to the out-of-sample (test) fold
             combo, horizon = best_params['combination'], best_params['horizon']
             mf_volume_test = (((df_test['close'] - df_test['low']) - (df_test['high'] - df_test['close'])) / (df_test['high'] - df_test['low']).replace(0, np.nan)).fillna(0) * df_test['volume']
             def normalize_zscore(data, window):
@@ -203,20 +214,20 @@ def run_walk_forward(data_path, symbol, interval):
             mfv_lines = [(normalize_zscore(mf_volume_test.rolling(window=r).sum(), r) * 10).clip(-100, 100) for r in combo]
             oos_signal = pd.concat(mfv_lines, axis=1).mean(axis=1)
 
-            _, oos_returns = calculate_performance_metrics(df_test, oos_signal, horizon, config['STOP_LOSS_PCT'], config['TAKE_PROFIT_PCT'], interval)
+            oos_returns = _numba_backtest_loop(
+                df_test['open'].to_numpy(), df_test['high'].to_numpy(), df_test['low'].to_numpy(),
+                oos_signal.to_numpy(), horizon, config['STOP_LOSS_PCT'], config['TAKE_PROFIT_PCT']
+            )
             all_oos_returns.append(oos_returns)
 
-        # Aggregate results
         if not best_params_per_fold:
             raise ValueError("Walk-forward analysis failed to find any robust parameters.")
 
         final_metrics = calculate_final_metrics(all_oos_returns, len(df), interval)
         
-        # Find the most frequently occurring "best" combination
         combo_counts = pd.Series([str(sorted(p['combination'])) for p in best_params_per_fold]).value_counts()
         best_overall_combo_str = combo_counts.index[0]
         
-        # Average the Youden's J score from the training folds
         avg_youdens_j = np.mean([p['youdens_j'] for p in best_params_per_fold])
 
         result = {

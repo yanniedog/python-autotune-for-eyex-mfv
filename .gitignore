@@ -1,3 +1,5 @@
 mfv_analysis_robust.log
 comprehensive_report_robust.json
 comprehensive_report_robust.csv
+mfv_orchestrator.log
+*.csv
