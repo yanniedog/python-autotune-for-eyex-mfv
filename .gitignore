@@ -5,3 +5,4 @@ mfv_orchestrator.log
 *.csv
 /__pycache__
 *.parquet
+adaptive_search_space.json

@@ -36,6 +36,7 @@ from typing import List, Tuple, Dict
 import numpy as np
 import pandas as pd
 from numba import njit, prange  # type: ignore
+import os
 
 # Optional dependencies – only needed for stage‑2 optimisation
 try:
@@ -145,6 +146,9 @@ _zcache: Dict[int, np.ndarray] = {}
 
 def _mfv_z(vol: np.ndarray, close: np.ndarray, period: int) -> np.ndarray:
     """Rolling money‑flow volume z‑score for a given period (cached)."""
+    if len(vol) < period * 2:
+        logger.warning(f"Insufficient data for period {period}: only {len(vol)} bars.")
+        return np.zeros(len(vol))
     key = period
     if key in _zcache:
         z = _zcache[key]
@@ -182,8 +186,17 @@ def _split_dataset(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Dat
 # Scoring helpers
 # ──────────────────────────────────────────────────────────────
 
-def _score_metrics(j: float, calmar: float, max_dd: float) -> float:
-    return 0.5 * j + 0.3 * calmar - 0.2 * max_dd
+def _score_metrics(j: float, calmar: float, max_dd: float, periods: tuple = None) -> float:
+    # Add a penalty for clustered periods (if provided)
+    penalty = 0.0
+    if periods is not None:
+        diffs = [abs(periods[0] - periods[1]), abs(periods[1] - periods[2]), abs(periods[0] - periods[2])]
+        min_diff = min(diffs)
+        # Penalize if any two periods are closer than 10% of the range
+        range_ = MAX_PERIOD - MIN_PERIOD
+        if min_diff < 0.1 * range_:
+            penalty = -0.2 * (0.1 * range_ - min_diff) / (0.1 * range_)
+    return 0.5 * j + 0.3 * calmar - 0.2 * max_dd + penalty
 
 
 # ──────────────────────────────────────────────────────────────
@@ -192,6 +205,9 @@ def _score_metrics(j: float, calmar: float, max_dd: float) -> float:
 
 def _evaluate_combo(periods: Tuple[int, int, int], df: pd.DataFrame) -> Tuple[float, float, float, float]:
     """Returns (YoudenJ, calmar, max_dd, win_rate)."""
+    if len(df) < max(periods) * 2:
+        logger.warning(f"Insufficient data for periods {periods}: only {len(df)} bars.")
+        return 0.0, 0.0, 0.0, 0.0
     vol = df["volume"].to_numpy(dtype=np.float64)
     close = df["close"].to_numpy(dtype=np.float64)
 
@@ -242,6 +258,9 @@ def _cv_eval(periods: Tuple[int, int, int], df: pd.DataFrame) -> Tuple[float, fl
     n = len(df)
     gap = max(periods)
     fold_size = n // TUNING_FOLDS
+    if fold_size <= 0 or n < gap * 2:
+        logger.warning(f"Insufficient data for cross-validation: {n} rows, gap {gap}, folds {TUNING_FOLDS}.")
+        return 0.0, 0.0, 0.0
     js, calmars, dds = [], [], []
     for i in range(TUNING_FOLDS):
         start = i * fold_size
@@ -255,6 +274,9 @@ def _cv_eval(periods: Tuple[int, int, int], df: pd.DataFrame) -> Tuple[float, fl
         js.append(j)
         calmars.append(calmar)
         dds.append(dd)
+    if not js:
+        logger.warning(f"No valid folds for cross-validation: {n} rows, gap {gap}, folds {TUNING_FOLDS}.")
+        return 0.0, 0.0, 0.0
     return float(np.mean(js)), float(np.mean(calmars)), float(np.mean(dds))
 
 
@@ -262,54 +284,74 @@ def _cv_eval(periods: Tuple[int, int, int], df: pd.DataFrame) -> Tuple[float, fl
 # Main optimisation routine
 # ──────────────────────────────────────────────────────────────
 
-def optimise(df_bench: pd.DataFrame, df_tune: pd.DataFrame) -> Tuple[Tuple[int, int, int], Dict[str, float]]:
-    """Return best periods and metrics from tuning block."""
-
-    lhs = _lhs_samples(LATIN_HYPER_SEEDS, 3, MIN_PERIOD, MAX_PERIOD)
+def optimise(df_bench: pd.DataFrame, df_tune: pd.DataFrame, symbol: str, interval: str) -> Tuple[Tuple[int, int, int], Dict[str, float]]:
+    """Return best periods and metrics from tuning block. Persist and reuse Optuna study. Use adaptive search space if provided."""
+    # Adaptive search space
+    min_period = MIN_PERIOD
+    max_period = MAX_PERIOD
+    adaptive_json = os.environ.get('ADAPTIVE_SEARCH_SPACE', '')
+    if adaptive_json:
+        try:
+            space = json.loads(adaptive_json)
+            min_period = max(MIN_PERIOD, int(space.get('min', MIN_PERIOD)))
+            max_period = min(MAX_PERIOD, int(space.get('max', MAX_PERIOD)))
+            logger.info(f"Using adaptive search space: min={min_period}, max={max_period}")
+        except Exception as e:
+            logger.warning(f"Failed to parse adaptive search space: {e}")
+    lhs = _lhs_samples(LATIN_HYPER_SEEDS, 3, min_period, max_period)
     logger.info("Stage‑1 LHS seeds: %d", len(lhs))
-
     seed_results = []
     for p in lhs:
         j, c, dd, w = _evaluate_combo(p, df_bench)
-        seed_results.append((p, _score_metrics(j, c, dd)))
+        seed_results.append((p, _score_metrics(j, c, dd, p)))
     seed_results.sort(key=lambda x: x[1], reverse=True)
     top_seeds = [p for p, _ in seed_results[: max(1, int(len(seed_results) * TOP_SEED_FRACTION))]]
-
     if optuna is None:
         logger.warning("Optuna not available – returning best LHS seed only")
         best_p = top_seeds[0]
         j, c, dd, w = _evaluate_combo(best_p, df_tune)
         return best_p, {"youden_j": j, "calmar": c, "max_dd": dd, "win_rate": w}
-
-    study = optuna.create_study(
-        direction="minimize",
-        sampler=TPESampler(seed=42),
-        pruner=MedianPruner(n_startup_trials=15, n_warmup_steps=0),
-    )
-
-    def objective(trial):  # inner closure
-        p1 = trial.suggest_int("p1", MIN_PERIOD, MAX_PERIOD)
-        p2 = trial.suggest_int("p2", p1 + 1, MAX_PERIOD)
-        p3 = trial.suggest_int("p3", p2 + 1, MAX_PERIOD)
+    # Persist study per symbol/interval
+    study_name = f"study_{symbol}_{interval}"
+    storage_path = f"sqlite:///optuna_{symbol}_{interval}.db"
+    if os.path.exists(f"optuna_{symbol}_{interval}.db"):
+        logger.info(f"Loading existing Optuna study for {symbol} {interval}")
+        study = optuna.load_study(study_name=study_name, storage=storage_path)
+    else:
+        logger.info(f"Creating new Optuna study for {symbol} {interval}")
+        study = optuna.create_study(
+            study_name=study_name,
+            direction="minimize",
+            sampler=TPESampler(seed=42),
+            pruner=MedianPruner(n_startup_trials=15, n_warmup_steps=0),
+            storage=storage_path,
+            load_if_exists=True,
+        )
+    def objective(trial):
+        p1 = trial.suggest_int("p1", min_period, max_period)
+        p2 = trial.suggest_int("p2", p1 + 1, max_period)
+        p3 = trial.suggest_int("p3", p2 + 1, max_period)
         periods = (p1, p2, p3)
-        # quick eval on benchmark
         j_b, c_b, dd_b, _ = _evaluate_combo(periods, df_bench)
+        score = -_score_metrics(j_b, c_b, dd_b, periods)
         trial.report(j_b, step=0)
-        # prune early if Youden J too low
         if trial.should_prune():
             raise optuna.TrialPruned()
-        # CV on tuning block
         j, c, dd = _cv_eval(periods, df_tune)
-        score = -_score_metrics(j, c, dd)  # Optuna minimises
+        score += -_score_metrics(j, c, dd, periods)
         return score
-
-    study.enqueue_trial({"p1": p[0], "p2": p[1], "p3": p[2]} for p in top_seeds)
-
-    study.optimize(objective, n_trials=200, show_progress_bar=False)
-
+    # Enqueue previous bests
+    if len(study.trials) > 0:
+        best_params = study.best_trial.params
+        best_p = (best_params["p1"], best_params["p2"], best_params["p3"])
+        study.enqueue_trial({"p1": best_p[0], "p2": best_p[1], "p3": best_p[2]})
+    for p in top_seeds:
+        study.enqueue_trial({"p1": p[0], "p2": p[1], "p3": p[2]})
+    study.optimize(objective, n_trials=100, show_progress_bar=False)
     best = study.best_trial.params
     best_p = (best["p1"], best["p2"], best["p3"])
     j, c, dd, w = _evaluate_combo(best_p, df_tune)
+    logger.info(f"Best periods: {best_p}, spreads: {[abs(best_p[0]-best_p[1]), abs(best_p[1]-best_p[2]), abs(best_p[0]-best_p[2])]}")
     return best_p, {"youden_j": j, "calmar": c, "max_dd": dd, "win_rate": w}
 
 
@@ -333,11 +375,15 @@ def _main(path: Path, symbol: str, interval: str):
         for col in ("open", "high", "low", "close", "volume"):
             if col not in df.columns:
                 raise ValueError(f"CSV missing column {col}")
-
+        if len(df) < MIN_PERIOD * 2:
+            msg = f"Insufficient data: only {len(df)} rows, need at least {MIN_PERIOD * 2}."
+            logger.error(msg)
+            output = {"status": "fail", "error": msg}
+            json.dump(output, sys.stdout, separators=(",", ":"))
+            return
         df_bench, df_tune, df_lock = _split_dataset(df)
-        best_p, tune_metrics = optimise(df_bench, df_tune)
+        best_p, tune_metrics = optimise(df_bench, df_tune, symbol, interval)
         lock_metrics = lockbox_validate(best_p, df_lock)
-
         result = {
             "status": "success",
             "symbol": symbol,
@@ -347,14 +393,14 @@ def _main(path: Path, symbol: str, interval: str):
             "lockbox": lock_metrics,
             "runtime_sec": round(time.time() - t0, 3),
         }
-        # Always include 'data' key in output
-        if 'data' not in result:
-            result['data'] = {}
-        json.dump(result, sys.stdout, separators=(",", ":"))
+        output = {"data": result, "status": "success"}
+        json.dump(output, sys.stdout, separators=(",", ":"))
     except Exception as e:
         logging.error(f'Exception in analyzer: {e}')
         logging.error(traceback.format_exc())
-        sys.exit(1)
+        output = {"status": "fail", "error": str(e)}
+        json.dump(output, sys.stdout, separators=(",", ":"))
+        sys.exit(0)
 
 
 if __name__ == "__main__":

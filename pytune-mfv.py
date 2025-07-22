@@ -209,80 +209,166 @@ def run_analyzer(csv_path: Path, symbol: str, interval: str, bench_pct: float, t
         log.warning("Analyser payload missing 'data' key for %s %s: %s", symbol, interval, payload)
         return payload
 
-# ────────────────────────────────────────────────────────────────────────────────
-# 5. MAIN ORCHESTRATION
-# ────────────────────────────────────────────────────────────────────────────────
+def flatten_result(data):
+    # Flatten nested dicts for CSV
+    flat = {
+        'status': data.get('status'),
+        'symbol': data.get('symbol'),
+        'interval': data.get('interval'),
+        'periods': str(data.get('periods')),
+        'runtime_sec': data.get('runtime_sec'),
+    }
+    for prefix in ['tuning', 'lockbox']:
+        d = data.get(prefix, {})
+        for k, v in d.items():
+            flat[f'{prefix}_{k}'] = v
+    if 'robustness_score' in data:
+        flat['robustness_score'] = data['robustness_score']
+    return flat
 
-def orchestrate() -> None:
-    results = []
+ADAPTIVE_SPACE_FILE = 'adaptive_search_space.json'
 
+# Helper to load/save adaptive search space
+
+def load_adaptive_space():
+    if os.path.exists(ADAPTIVE_SPACE_FILE):
+        with open(ADAPTIVE_SPACE_FILE, 'r') as f:
+            return json.load(f)
+    return {}
+
+def save_adaptive_space(space):
+    with open(ADAPTIVE_SPACE_FILE, 'w') as f:
+        json.dump(space, f)
+
+
+def orchestrate():
+    print("\n========== [MFV Orchestrator] Continual Refinement Mode ==========")
+    prev_best_score = None
+    prev_avg_score = None
+    iteration = 0
+    all_results = []
+    # Fetch and cache klines ONCE per symbol/interval
     tasks: List[Tuple[str, str]] = [(s, i) for s in CONFIG["SYMBOLS"] for i in CONFIG["INTERVALS"]]
-
-    # Fetch klines in parallel to maximise IO latency hiding
+    klines_cache = {}
+    adaptive_space = load_adaptive_space()
     with ThreadPoolExecutor(max_workers=CONFIG["MAX_FETCH_WORKERS"]) as pool:
         future_map = {
             pool.submit(fetch_klines, sym, interv, CONFIG["MAX_BARS"]): (sym, interv)
             for sym, interv in tasks
         }
-        for fut in tqdm(as_completed(future_map), total=len(future_map), desc="Download tasks"):
+        for fut in tqdm(as_completed(future_map), total=len(future_map), desc="Initial kline fetch"):
             symbol, interval = future_map[fut]
             try:
                 df = fut.result()
+                klines_cache[(symbol, interval)] = df
+                print(f"[CACHE] {symbol} {interval}: {len(df)} bars cached.")
             except Exception as exc:
                 log.error("Download failed for %s %s: %s", symbol, interval, exc)
-                continue
-
-            # Partition and stage CSV
-            bench, tune, lock = partition_df(df)
-            with tempfile.NamedTemporaryFile("w", delete=False, suffix=".csv") as tmp:
-                df.to_csv(tmp.name, index=False)
-                csv_path = Path(tmp.name)
-
-            data = run_analyzer(csv_path, symbol, interval,
-                                CONFIG["BENCHMARK_PCT"], CONFIG["TUNE_PCT"])
-            csv_path.unlink(missing_ok=True)
-            if data:
-                results.append(data)
-
-    if not results:
-        log.error("No successful analyser results – exiting")
+                print(f"[ERROR] Download failed for {symbol} {interval}: {exc}")
+    try:
+        while True:
+            iteration += 1
+            print(f"\n[Iteration {iteration}] Starting...")
+            results = []
+            for symbol, interval in tasks:
+                df = klines_cache.get((symbol, interval))
+                if df is None:
+                    print(f"[SKIP] No data for {symbol} {interval}")
+                    continue
+                print(f"Partitioning data for {symbol} {interval} ...")
+                bench, tune, lock = partition_df(df)
+                print(f"  Benchmark: {len(bench)} | Tune: {len(tune)} | Lock-box: {len(lock)}")
+                with tempfile.NamedTemporaryFile("w", delete=False, suffix=".csv") as tmp:
+                    df.to_csv(tmp.name, index=False)
+                    csv_path = Path(tmp.name)
+                print(f"Running analyzer for {symbol} {interval} ...")
+                # Pass adaptive search space as env var
+                env = os.environ.copy()
+                pair_key = f"{symbol}_{interval}"
+                if pair_key in adaptive_space:
+                    env['ADAPTIVE_SEARCH_SPACE'] = json.dumps(adaptive_space[pair_key])
+                else:
+                    env['ADAPTIVE_SEARCH_SPACE'] = ''
+                # Use subprocess directly to pass env
+                import subprocess
+                cmd = [sys.executable, "walk_forward_analyzer.py", str(csv_path), symbol, interval]
+                proc = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=CONFIG["ANALYSIS_TIMEOUT"])
+                csv_path.unlink(missing_ok=True)
+                if proc.returncode == 0:
+                    try:
+                        payload = json.loads(proc.stdout)
+                        if payload.get("status") == "success" and "data" in payload:
+                            print(f"[OK] Analyzer completed for {symbol} {interval}")
+                            results.append(flatten_result(payload["data"]))
+                            # Update adaptive space with best periods
+                            best_periods = payload["data"].get("periods")
+                            if best_periods:
+                                # Narrow search space by 20% around best
+                                min_p = max(CONFIG['MAX_BARS']//100, int(min(best_periods) * 0.8))
+                                max_p = min(CONFIG['MAX_BARS'], int(max(best_periods) * 1.2))
+                                adaptive_space[pair_key] = {'min': min_p, 'max': max_p}
+                    except Exception as e:
+                        print(f"[FAIL] Analyzer output error for {symbol} {interval}: {e}")
+                else:
+                    print(f"[FAIL] Analyzer failed for {symbol} {interval}")
+            save_adaptive_space(adaptive_space)
+            if not results:
+                log.error("No successful analyser results – exiting")
+                print("[FATAL] No successful analyser results – exiting")
+                break
+            # Aggregate and rank
+            df_res = pd.DataFrame(results)
+            # Normalise metrics 0‑1 for composite score
+            norm_cols = []
+            for col in ("tuning_youden_j", "tuning_calmar", "tuning_max_drawdown", "tuning_max_dd"):
+                if col not in df_res:
+                    continue
+                norm_col = col + "_norm"
+                norm_cols.append(norm_col)
+                if col == "tuning_max_drawdown" or col == "tuning_max_dd":
+                    df_res[norm_col] = 1 - (df_res[col] - df_res[col].min()) / (df_res[col].max() - df_res[col].min())
+                else:
+                    df_res[norm_col] = (df_res[col] - df_res[col].min()) / (df_res[col].max() - df_res[col].min())
+            # Use available normalized columns for robustness_score
+            score_expr = []
+            if "tuning_youden_j_norm" in df_res:
+                score_expr.append("0.5 * df_res['tuning_youden_j_norm']")
+            if "tuning_calmar_norm" in df_res:
+                score_expr.append("0.3 * df_res['tuning_calmar_norm']")
+            if "tuning_max_drawdown_norm" in df_res:
+                score_expr.append("0.2 * df_res['tuning_max_drawdown_norm']")
+            elif "tuning_max_dd_norm" in df_res:
+                score_expr.append("0.2 * df_res['tuning_max_dd_norm']")
+            if score_expr:
+                df_res["robustness_score"] = eval(" + ".join(score_expr))
+                df_res.sort_values("robustness_score", ascending=False, inplace=True)
+            else:
+                log.warning("No normalized columns found for robustness_score calculation.")
+                print("[WARN] No normalized columns found for robustness_score calculation.")
+            # Save & print CSV (append or overwrite)
+            out_f = Path("walk_forward_report.csv")
+            df_res.to_csv(out_f, index=False, float_format='%.6g')
+            print(f"[Iteration {iteration}] Updated report → {out_f} ({len(df_res)} rows)")
+            # Show performance improvement
+            best_score = df_res["robustness_score"].max() if "robustness_score" in df_res else None
+            avg_score = df_res["robustness_score"].mean() if "robustness_score" in df_res else None
+            if prev_best_score is not None and best_score is not None:
+                print(f"[Iteration {iteration}] Best robustness score: {best_score:.4f} (Δ {best_score - prev_best_score:+.4f})")
+            elif best_score is not None:
+                print(f"[Iteration {iteration}] Best robustness score: {best_score:.4f}")
+            if prev_avg_score is not None and avg_score is not None:
+                print(f"[Iteration {iteration}] Avg robustness score: {avg_score:.4f} (Δ {avg_score - prev_avg_score:+.4f})")
+            elif avg_score is not None:
+                print(f"[Iteration {iteration}] Avg robustness score: {avg_score:.4f}")
+            prev_best_score = best_score
+            prev_avg_score = avg_score
+            all_results.append(df_res)
+            print(f"[Iteration {iteration}] Press Ctrl+C to stop or wait for next refinement...\n")
+    except KeyboardInterrupt:
+        print("\n[STOPPED] Continual refinement stopped by user.")
+        print(f"Total iterations completed: {iteration}")
+        print(f"Final report: walk_forward_report.csv")
         return
-
-    # Aggregate and rank
-    df_res = pd.DataFrame(results)
-    # Normalise metrics 0‑1 for composite score
-    norm_cols = []
-    for col in ("youden_j", "calmar", "max_drawdown", "max_dd"):
-        if col not in df_res:
-            continue
-        norm_col = col + "_norm"
-        norm_cols.append(norm_col)
-        if col == "max_drawdown" or col == "max_dd":
-            df_res[norm_col] = 1 - (df_res[col] - df_res[col].min()) / (df_res[col].max() - df_res[col].min())
-        else:
-            df_res[norm_col] = (df_res[col] - df_res[col].min()) / (df_res[col].max() - df_res[col].min())
-
-    # Use available normalized columns for robustness_score
-    score_expr = []
-    if "youden_j_norm" in df_res:
-        score_expr.append("0.5 * df_res['youden_j_norm']")
-    if "calmar_norm" in df_res:
-        score_expr.append("0.3 * df_res['calmar_norm']")
-    if "max_drawdown_norm" in df_res:
-        score_expr.append("0.2 * df_res['max_drawdown_norm']")
-    elif "max_dd_norm" in df_res:
-        score_expr.append("0.2 * df_res['max_dd_norm']")
-    if score_expr:
-        df_res["robustness_score"] = eval(" + ".join(score_expr))
-        df_res.sort_values("robustness_score", ascending=False, inplace=True)
-    else:
-        log.warning("No normalized columns found for robustness_score calculation.")
-
-    # Save & print
-    out_f = Path("walk_forward_report.csv")
-    df_res.to_csv(out_f, index=False)
-    log.info("Saved report → %s (%d rows)", out_f, len(df_res))
-    print(df_res.head(20).to_markdown(index=False))
 
 # ────────────────────────────────────────────────────────────────────────────────
 # 6. CLI
@@ -298,6 +384,20 @@ def parse_cli() -> argparse.Namespace:
 
 
 if __name__ == "__main__":
+    import glob
+    # Close all log handlers before deleting log files
+    for handler in root_logger.handlers[:]:
+        handler.close()
+        root_logger.removeHandler(handler)
+    try:
+        # Delete .log and .csv files in the working directory
+        for pattern in ("*.log", "*.csv"):
+            for f in glob.glob(pattern):
+                print(f"Deleting {f} ...")
+                os.remove(f)
+    except Exception as e:
+        print(f"Error deleting logs or csv files: {e}")
+        sys.exit(1)
     ARGS = parse_cli()
     if ARGS.debug:
         root_logger.setLevel(logging.DEBUG)
