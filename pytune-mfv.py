@@ -460,7 +460,11 @@ def orchestrate():
                 ax_table.clear()
                 table_data = []
                 table_cols = ["Symbol", "Interval", "Best Periods", "Robustness", "YoudenJ (mean±CI)", "Calmar (mean±CI)", "MaxDD (mean±CI)"]
-                for (symbol, interval) in sorted(set(zip(full_history['symbol'], full_history['interval']))):
+                # Custom interval order for sorting
+                interval_order = {v: i for i, v in enumerate(["1s", "1m", "5m", "1h", "4h", "1d"])}
+                pairs = set(zip(full_history['symbol'], full_history['interval']))
+                sorted_pairs = sorted(pairs, key=lambda x: (x[0], interval_order.get(x[1], 999)))
+                for (symbol, interval) in sorted_pairs:
                     pair_rows = full_history[(full_history['symbol'] == symbol) & (full_history['interval'] == interval)]
                     if pair_rows.empty:
                         continue
