@@ -192,10 +192,10 @@ def _score_metrics(j: float, calmar: float, max_dd: float, periods: tuple = None
     if periods is not None:
         diffs = [abs(periods[0] - periods[1]), abs(periods[1] - periods[2]), abs(periods[0] - periods[2])]
         min_diff = min(diffs)
-        # Penalize if any two periods are closer than 10% of the range
         range_ = MAX_PERIOD - MIN_PERIOD
-        if min_diff < 0.1 * range_:
-            penalty = -0.2 * (0.1 * range_ - min_diff) / (0.1 * range_)
+        # Stronger penalty for close periods
+        if min_diff < 0.2 * range_:
+            penalty = -0.8 * (0.2 * range_ - min_diff) / (0.2 * range_)
     return 0.5 * j + 0.3 * calmar - 0.2 * max_dd + penalty
 
 
@@ -205,6 +205,9 @@ def _score_metrics(j: float, calmar: float, max_dd: float, periods: tuple = None
 
 def _evaluate_combo(periods: Tuple[int, int, int], df: pd.DataFrame) -> Tuple[float, float, float, float]:
     """Returns (YoudenJ, calmar, max_dd, win_rate)."""
+    if not periods or len(periods) != 3:
+        logger.error(f"Invalid periods tuple passed to _evaluate_combo: {periods}")
+        return 0.0, 0.0, 0.0, 0.0
     if len(df) < max(periods) * 2:
         logger.warning(f"Insufficient data for periods {periods}: only {len(df)} bars.")
         return 0.0, 0.0, 0.0, 0.0
@@ -236,17 +239,27 @@ def _evaluate_combo(periods: Tuple[int, int, int], df: pd.DataFrame) -> Tuple[fl
 # Stage‑1: Latin‑hypercube seeds
 # ──────────────────────────────────────────────────────────────
 
-def _lhs_samples(n: int, dim: int, low: int, high: int) -> List[Tuple[int, int, int]]:
+def _lhs_samples(n: int, dim: int, low: int, high: int, min_gap: int = None) -> List[Tuple[int, int, int]]:
     rng = np.random.default_rng(42)
     cut = np.linspace(0, 1, n + 1)
+    if min_gap is None:
+        min_gap = max(1, int(0.1 * (high - low)))
+    # Check if search space is valid
+    if low + min_gap * 2 >= high:
+        raise ValueError(f"Search space too narrow for period diversity: low={low}, high={high}, min_gap={min_gap}")
     u = rng.random((dim, n)) * (cut[1:] - cut[:-1]) + cut[:-1]
     lhs = np.transpose(u)
     rng.shuffle(lhs)
     periods = []
     for row in lhs:
-        p = tuple(sorted((int(low + r * (high - low)) for r in row)))  # type: ignore
-        if p[0] < p[1] < p[2]:
-            periods.append(p)  # type: ignore
+        p = tuple(sorted((int(low + r * (high - low)) for r in row)))
+        if p[0] < p[1] < p[2] and (p[1] - p[0] >= min_gap) and (p[2] - p[1] >= min_gap) and (p[2] - p[0] >= 2 * min_gap):
+            periods.append(p)
+    # If not enough diverse samples, add randoms
+    while len(periods) < n:
+        p = tuple(sorted(rng.integers(low, high, size=3)))
+        if p[0] < p[1] < p[2] and (p[1] - p[0] >= min_gap) and (p[2] - p[1] >= min_gap) and (p[2] - p[0] >= 2 * min_gap):
+            periods.append(p)
     return periods[:n]
 
 
@@ -298,8 +311,19 @@ def optimise(df_bench: pd.DataFrame, df_tune: pd.DataFrame, symbol: str, interva
             logger.info(f"Using adaptive search space: min={min_period}, max={max_period}")
         except Exception as e:
             logger.warning(f"Failed to parse adaptive search space: {e}")
-    lhs = _lhs_samples(LATIN_HYPER_SEEDS, 3, min_period, max_period)
-    logger.info("Stage‑1 LHS seeds: %d", len(lhs))
+    # Use a larger min_gap for early diversity
+    min_gap = max(2, int(0.15 * (max_period - min_period)))
+    if min_period + min_gap * 2 >= max_period:
+        msg = f"Search space too narrow for period diversity: min={min_period}, max={max_period}, min_gap={min_gap}"
+        logger.error(msg)
+        return ((), {"status": "fail", "error": msg})
+    try:
+        lhs = _lhs_samples(LATIN_HYPER_SEEDS, 3, min_period, max_period, min_gap=min_gap)
+    except Exception as e:
+        msg = f"Failed to generate period samples: {e}"
+        logger.error(msg)
+        return ((), {"status": "fail", "error": msg})
+    logger.info(f"Stage‑1 LHS seeds: {len(lhs)} (min_gap={min_gap})")
     seed_results = []
     for p in lhs:
         j, c, dd, w = _evaluate_combo(p, df_bench)
@@ -328,9 +352,13 @@ def optimise(df_bench: pd.DataFrame, df_tune: pd.DataFrame, symbol: str, interva
             load_if_exists=True,
         )
     def objective(trial):
+        # Enforce diversity in Optuna as well
+        min_gap_opt = max(2, int(0.15 * (max_period - min_period)))
+        if min_period + min_gap_opt * 2 >= max_period:
+            raise optuna.TrialPruned(f"Search space too narrow for period diversity: min={min_period}, max={max_period}, min_gap={min_gap_opt}")
         p1 = trial.suggest_int("p1", min_period, max_period)
-        p2 = trial.suggest_int("p2", p1 + 1, max_period)
-        p3 = trial.suggest_int("p3", p2 + 1, max_period)
+        p2 = trial.suggest_int("p2", p1 + min_gap_opt, max_period)
+        p3 = trial.suggest_int("p3", p2 + min_gap_opt, max_period)
         periods = (p1, p2, p3)
         j_b, c_b, dd_b, _ = _evaluate_combo(periods, df_bench)
         score = -_score_metrics(j_b, c_b, dd_b, periods)
@@ -360,6 +388,9 @@ def optimise(df_bench: pd.DataFrame, df_tune: pd.DataFrame, symbol: str, interva
 # ──────────────────────────────────────────────────────────────
 
 def lockbox_validate(periods: Tuple[int, int, int], df_lock: pd.DataFrame) -> Dict[str, float]:
+    if not periods or len(periods) != 3:
+        logger.error(f"Invalid periods tuple passed to lockbox_validate: {periods}")
+        return {"youden_j": 0.0, "calmar": 0.0, "max_dd": 0.0, "win_rate": 0.0}
     j, c, dd, w = _evaluate_combo(periods, df_lock)
     return {"youden_j": j, "calmar": c, "max_dd": dd, "win_rate": w}
 
@@ -383,15 +414,32 @@ def _main(path: Path, symbol: str, interval: str):
             return
         df_bench, df_tune, df_lock = _split_dataset(df)
         best_p, tune_metrics = optimise(df_bench, df_tune, symbol, interval)
+        if not best_p or len(best_p) != 3:
+            msg = f"No valid periods found for {symbol} {interval}. Aborting."
+            logger.error(msg)
+            output = {"status": "fail", "error": msg}
+            json.dump(output, sys.stdout, separators=(",", ":"))
+            return
         lock_metrics = lockbox_validate(best_p, df_lock)
+        # Convert all output to native Python types
+        def pyify(x):
+            if isinstance(x, (np.integer, np.int64, np.int32)):
+                return int(x)
+            if isinstance(x, (np.floating, np.float64, np.float32)):
+                return float(x)
+            if isinstance(x, (list, tuple)):
+                return [pyify(i) for i in x]
+            if isinstance(x, dict):
+                return {k: pyify(v) for k, v in x.items()}
+            return x
         result = {
             "status": "success",
             "symbol": symbol,
             "interval": interval,
-            "periods": best_p,
-            "tuning": tune_metrics,
-            "lockbox": lock_metrics,
-            "runtime_sec": round(time.time() - t0, 3),
+            "periods": pyify(best_p),
+            "tuning": pyify(tune_metrics),
+            "lockbox": pyify(lock_metrics),
+            "runtime_sec": float(round(time.time() - t0, 3)),
         }
         output = {"data": result, "status": "success"}
         json.dump(output, sys.stdout, separators=(",", ":"))

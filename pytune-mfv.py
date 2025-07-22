@@ -49,6 +49,13 @@ except ImportError as e:
     logging.error('Missing required parquet engine: pyarrow or fastparquet. Please install them.')
     sys.exit(1)
 
+from collections import defaultdict
+try:
+    from tabulate import tabulate
+    TABULATE_AVAILABLE = True
+except ImportError:
+    TABULATE_AVAILABLE = False
+
 # ────────────────────────────────────────────────────────────────────────────────
 # 0. CONFIGURATION
 # ────────────────────────────────────────────────────────────────────────────────
@@ -247,24 +254,26 @@ def orchestrate():
     prev_avg_score = None
     iteration = 0
     all_results = []
+    prev_rows = defaultdict(dict)  # (symbol, interval) -> last row dict
     # Fetch and cache klines ONCE per symbol/interval
     tasks: List[Tuple[str, str]] = [(s, i) for s in CONFIG["SYMBOLS"] for i in CONFIG["INTERVALS"]]
     klines_cache = {}
     adaptive_space = load_adaptive_space()
-    with ThreadPoolExecutor(max_workers=CONFIG["MAX_FETCH_WORKERS"]) as pool:
-        future_map = {
-            pool.submit(fetch_klines, sym, interv, CONFIG["MAX_BARS"]): (sym, interv)
-            for sym, interv in tasks
-        }
-        for fut in tqdm(as_completed(future_map), total=len(future_map), desc="Initial kline fetch"):
-            symbol, interval = future_map[fut]
-            try:
-                df = fut.result()
-                klines_cache[(symbol, interval)] = df
-                print(f"[CACHE] {symbol} {interval}: {len(df)} bars cached.")
-            except Exception as exc:
-                log.error("Download failed for %s %s: %s", symbol, interval, exc)
-                print(f"[ERROR] Download failed for {symbol} {interval}: {exc}")
+    # Sequential fetching for debugging
+    for sym, interv in tasks:
+        try:
+            df = fetch_klines(sym, interv, CONFIG["MAX_BARS"])
+            klines_cache[(sym, interv)] = df
+            print(f"[CACHE] {sym} {interv}: {len(df)} bars cached.")
+            n = len(df)
+            min_period = max(10, n // 1000)
+            max_period = max(min_period + 1, n // 6)
+            pair_key = f"{sym}_{interv}"
+            adaptive_space[pair_key] = {'min': min_period, 'max': max_period}
+        except Exception as exc:
+            log.error("Download failed for %s %s: %s", sym, interv, exc)
+            print(f"[ERROR] Download failed for {sym} {interv}: {exc}")
+    save_adaptive_space(adaptive_space)
     try:
         while True:
             iteration += 1
@@ -294,23 +303,31 @@ def orchestrate():
                 cmd = [sys.executable, "walk_forward_analyzer.py", str(csv_path), symbol, interval]
                 proc = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=CONFIG["ANALYSIS_TIMEOUT"])
                 csv_path.unlink(missing_ok=True)
-                if proc.returncode == 0:
-                    try:
-                        payload = json.loads(proc.stdout)
-                        if payload.get("status") == "success" and "data" in payload:
-                            print(f"[OK] Analyzer completed for {symbol} {interval}")
-                            results.append(flatten_result(payload["data"]))
-                            # Update adaptive space with best periods
-                            best_periods = payload["data"].get("periods")
-                            if best_periods:
-                                # Narrow search space by 20% around best
-                                min_p = max(CONFIG['MAX_BARS']//100, int(min(best_periods) * 0.8))
-                                max_p = min(CONFIG['MAX_BARS'], int(max(best_periods) * 1.2))
-                                adaptive_space[pair_key] = {'min': min_p, 'max': max_p}
-                    except Exception as e:
-                        print(f"[FAIL] Analyzer output error for {symbol} {interval}: {e}")
+                try:
+                    payload = json.loads(proc.stdout)
+                except Exception as e:
+                    print(f"[FAIL] Analyzer output error for {symbol} {interval}: {e}")
+                    log.error(f"Analyzer output error for {symbol} {interval}: {e}\nRaw output: {proc.stdout[:300]}")
+                    continue
+                if payload.get("status") == "success" and "data" in payload:
+                    print(f"[OK] Analyzer completed for {symbol} {interval}")
+                    results.append(flatten_result(payload["data"]))
+                    # Update adaptive space with best periods
+                    best_periods = payload["data"].get("periods")
+                    if best_periods:
+                        # Narrow search space by 20% around best
+                        min_p = max(CONFIG['MAX_BARS']//100, int(min(best_periods) * 0.8))
+                        max_p = min(CONFIG['MAX_BARS'], int(max(best_periods) * 1.2))
+                        adaptive_space[pair_key] = {'min': min_p, 'max': max_p}
+                elif payload.get("status") == "fail":
+                    err = payload.get("error", "Unknown error")
+                    print(f"[FAIL] Analyzer failed for {symbol} {interval}: {err}")
+                    log.error(f"Analyzer failed for {symbol} {interval}: {err}")
+                    continue
                 else:
-                    print(f"[FAIL] Analyzer failed for {symbol} {interval}")
+                    print(f"[FAIL] Analyzer returned unexpected output for {symbol} {interval}: {payload}")
+                    log.error(f"Analyzer returned unexpected output for {symbol} {interval}: {payload}")
+                    continue
             save_adaptive_space(adaptive_space)
             if not results:
                 log.error("No successful analyser results – exiting")
@@ -352,6 +369,42 @@ def orchestrate():
             # Show performance improvement
             best_score = df_res["robustness_score"].max() if "robustness_score" in df_res else None
             avg_score = df_res["robustness_score"].mean() if "robustness_score" in df_res else None
+            # Build and print full metrics table with deltas
+            cols = [
+                "symbol", "interval", "periods", "robustness_score",
+                "tuning_youden_j", "tuning_calmar", "tuning_max_dd",
+                "lockbox_youden_j", "lockbox_calmar", "lockbox_max_dd"
+            ]
+            delta_cols = [c + "_delta" for c in cols[3:]]
+            table = []
+            for _, row in df_res.iterrows():
+                key = (row["symbol"], row["interval"])
+                prev = prev_rows.get(key, {})
+                row_out = [row.get(c, "") for c in cols]
+                # Compute deltas
+                for c in cols[3:]:
+                    prev_val = prev.get(c, None)
+                    curr_val = row.get(c, None)
+                    if prev_val is not None and curr_val is not None:
+                        try:
+                            delta = float(curr_val) - float(prev_val)
+                            row_out.append(f"{delta:+.4g}")
+                        except Exception:
+                            row_out.append("N/A")
+                    else:
+                        row_out.append("N/A")
+                table.append(row_out)
+                # Save for next iteration
+                prev_rows[key] = {c: row.get(c, None) for c in cols}
+            headers = cols + delta_cols
+            print("\n[Iteration {}] Full Metrics Table:".format(iteration))
+            if TABULATE_AVAILABLE:
+                print(tabulate(table, headers=headers, floatfmt=".4g"))
+            else:
+                # Fallback: plain text
+                print("\t".join(headers))
+                for row in table:
+                    print("\t".join(str(x) for x in row))
             if prev_best_score is not None and best_score is not None:
                 print(f"[Iteration {iteration}] Best robustness score: {best_score:.4f} (Δ {best_score - prev_best_score:+.4f})")
             elif best_score is not None:
