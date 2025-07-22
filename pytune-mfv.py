@@ -127,14 +127,13 @@ def process_klines_to_dataframe(klines):
     return df
 
 # ==============================================================================
-# --- NEW: NUMBA ACCELERATED CORE BACKTESTING ENGINE ---
+# --- NUMBA ACCELERATED CORE BACKTESTING ENGINE ---
 # ==============================================================================
 @jit(nopython=True)
 def _numba_backtest_loop(open_price, high_price, low_price, signal, horizon, sl_pct, tp_pct):
     """
     This function contains the core backtesting loop.
     The @jit decorator compiles it to high-speed machine code.
-    It only works with NumPy arrays and simple Python types.
     """
     returns = np.zeros(len(open_price))
     trade_count = 0
@@ -165,7 +164,7 @@ def _numba_backtest_loop(open_price, high_price, low_price, signal, horizon, sl_
             returns[trade_count] = outcome
             trade_count += 1
             
-    return returns[:trade_count] # Return only the trades that were executed
+    return returns[:trade_count]
 
 def get_periods_per_year(interval_str):
     """Estimates the number of trading periods in a year for annualization."""
@@ -176,24 +175,18 @@ def get_periods_per_year(interval_str):
     return 252
 
 def calculate_performance_metrics(df, signal_series, horizon, sl_pct, tp_pct, interval):
-    """
-    Calculates all key performance metrics.
-    This function now prepares data for the Numba engine and processes its results.
-    """
+    """Prepares data for Numba engine and processes its results."""
     if df.empty or signal_series.empty: return {}, []
 
-    # Prepare NumPy arrays for the high-speed Numba function
     open_price = df['open'].to_numpy()
     high_price = df['high'].to_numpy()
     low_price = df['low'].to_numpy()
     signal = signal_series.to_numpy()
 
-    # Call the fast, JIT-compiled function to get trade returns
     returns_np = _numba_backtest_loop(open_price, high_price, low_price, signal, horizon, sl_pct, tp_pct)
     
     if returns_np.size == 0: return {'youdens_j': -1, 'calmar_ratio': -999, 'max_drawdown_pct': 100}, []
 
-    # --- Process the results from the Numba engine ---
     win_rate = np.sum(returns_np > 0) / len(returns_np) if returns_np.size > 0 else 0
     gross_profit = np.sum(returns_np[returns_np > 0]); gross_loss = np.abs(np.sum(returns_np[returns_np < 0]))
     profit_factor = gross_profit / gross_loss if gross_loss > 0 else np.inf
@@ -205,7 +198,6 @@ def calculate_performance_metrics(df, signal_series, horizon, sl_pct, tp_pct, in
     annualized_return = (total_return / num_years) if num_years > 0 else 0
     calmar_ratio = annualized_return / max_drawdown_pct if max_drawdown_pct > 0 else np.inf
     
-    # Youden's J calculation remains here as it uses Pandas
     price_roc = df['close'].pct_change(periods=horizon).shift(-horizon) * 100
     combined = pd.DataFrame({'signal': signal_series, 'roc': price_roc}).dropna()
     signal_sign, roc_sign = np.sign(combined['signal']), np.sign(combined['roc'])
@@ -279,7 +271,6 @@ def run_analysis(df, interval):
     peak_combinations = list(combinations([p['period'] for p in diverse_peaks], CONFIG['COMBINATION_SIZE']))
     logging.info(f"Analyzing {len(peak_combinations)} combinations...")
     all_combinations_results = []
-    # Using ProcessPoolExecutor to parallelize the analysis
     with ProcessPoolExecutor() as executor:
         futures = {executor.submit(discover_best_horizon_for_combination, df, combo, interval): combo for combo in peak_combinations}
         for future in tqdm(as_completed(futures), total=len(futures), desc="Analyzing Combinations"):
@@ -294,11 +285,17 @@ def run_analysis(df, interval):
 # ==============================================================================
 def make_json_serializable(obj):
     """Recursively converts numpy types to native Python types for JSON."""
-    if isinstance(obj, (np.integer, np.int64)): return int(obj)
-    if isinstance(obj, (np.floating, np.float64)): return float(obj)
-    if isinstance(obj, np.ndarray): return obj.tolist()
-    if isinstance(obj, dict): return {k: make_json_serializable(v) for k, v in obj.items()}
-    if isinstance(obj, list): return [make_json_serializable(i) for i in obj]
+    if isinstance(obj, np.integer):
+        return int(obj)
+    elif isinstance(obj, np.floating):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, dict):
+        return {k: make_json_serializable(v) for k, v in obj.items()}
+    # FIX: Explicitly handle tuples to convert their contents
+    elif isinstance(obj, (list, tuple)):
+        return [make_json_serializable(i) for i in obj]
     return obj
     
 def generate_equity_curve_plot(top_candidate, symbol, interval):
