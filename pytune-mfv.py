@@ -57,6 +57,7 @@ except ImportError:
     TABULATE_AVAILABLE = False
 
 import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
 
 # ────────────────────────────────────────────────────────────────────────────────
 # 0. CONFIGURATION
@@ -447,6 +448,10 @@ def orchestrate():
                 ax.set_ylabel("Average % Delta from Iter 1")
                 ax.legend(loc="best", fontsize="small")
                 ax.grid(True)
+                # Format y-axis as percentage
+                ax.yaxis.set_major_formatter(mticker.PercentFormatter())
+                # Force x-axis to show only integer ticks
+                ax.xaxis.set_major_locator(mticker.MaxNLocator(integer=True))
                 fig.canvas.draw()
                 fig.canvas.flush_events()
             print(f"[Iteration {iteration}] Press Ctrl+C to stop or wait for next refinement...\n")
