@@ -281,17 +281,13 @@ def orchestrate():
         plt.ion()
         metrics_to_plot = [
             "robustness_score",
-            "tuning_youden_j",
-            "tuning_calmar",
-            "tuning_max_dd",
             "lockbox_youden_j",
             "lockbox_calmar",
             "lockbox_max_dd"
         ]
         fig, ax = plt.subplots()
-        fig.suptitle("Average % Delta Across All Symbol/Intervals")
+        fig.suptitle("Average Robustness & Lockbox Scores Across All Symbol/Intervals")
         report_file = Path("walk_forward_report.csv")
-        # If the report file exists, load it to continue history
         if report_file.exists():
             full_history = pd.read_csv(report_file)
         else:
@@ -429,9 +425,7 @@ def orchestrate():
                         pass
                 # --- Plot average % delta for each metric over all iterations ---
                 ax.clear()
-                # For each metric, build a list of average % delta per iteration
                 for metric in metrics_to_plot:
-                    # For each iteration, get all values for this metric
                     avg_pct_deltas = []
                     iter_nums = sorted(full_history["iteration"].unique())
                     for iter_num in iter_nums:
@@ -440,11 +434,15 @@ def orchestrate():
                             avg_pct_deltas.append(None)
                             continue
                         y0 = vals[0] if vals[0] != 0 else 1e-8
-                        avg_pct_delta = sum((v - y0) / abs(y0) * 100 for v in vals) / len(vals)
+                        # For lockbox_max_dd, plot negative so up is better
+                        if metric == "lockbox_max_dd":
+                            avg_pct_delta = sum((-(v - y0) / abs(y0) * 100) for v in vals) / len(vals)
+                        else:
+                            avg_pct_delta = sum((v - y0) / abs(y0) * 100 for v in vals) / len(vals)
                         avg_pct_deltas.append(avg_pct_delta)
-                    # Only plot if we have at least 2 points
                     if sum(x is not None for x in avg_pct_deltas) > 1:
-                        ax.plot(iter_nums, [x if x is not None else float('nan') for x in avg_pct_deltas], label=metric)
+                        label = metric if metric != "lockbox_max_dd" else "-lockbox_max_dd (up=better)"
+                        ax.plot(iter_nums, [x if x is not None else float('nan') for x in avg_pct_deltas], label=label)
                 ax.set_xlabel("Iteration")
                 ax.set_ylabel("Average % Delta from Iter 1")
                 ax.legend(loc="best", fontsize="small")
