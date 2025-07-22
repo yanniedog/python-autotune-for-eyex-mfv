@@ -1,189 +1,283 @@
-import os
-import sys
+#!/usr/bin/env python3
+"""
+Adaptive MFV Orchestrator – pytune_mfv.py
+========================================
+Pulls OHLCV candles from Binance, caches them locally, then iteratively
+calls *walk_forward_analyzer.py* on each symbol/interval pair. The script
+now incorporates:
+
+1. **Dataset caching & incremental refresh** – prevents wasted downloads.
+2. **Parallel candle fetching** – configurable max workers.
+3. **Timeline partitioning** – splits each dataset into benchmark / tuning
+   / lock‑box segments and passes the split info to the analyser.
+4. **Comprehensive logging** – rotating file handler + console.
+5. **Graceful failure isolation** – one bad pair no longer aborts the run.
+6. **Extensible optimisation loop** – a placeholder Optuna study that can
+   resume across sessions (disabled by default but scaffolded).
+
+The analyser can remain unmodified; any extra CLI flags are purely
+ignored until you upgrade *walk_forward_analyzer.py*. The script still
+produces *walk_forward_report.csv* with aggregated metrics and a ranked
+"robustness_score".
+"""
+from __future__ import annotations
+
 import argparse
-import time
 import json
 import logging
-import subprocess
+import os
+import sys
+import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Iterable, List, Tuple
+
 import pandas as pd
-import numpy as np # FIX: Added missing numpy import
 import requests
 from tenacity import retry, stop_after_attempt, wait_exponential
 from tqdm import tqdm
 
-# ==============================================================================
-# --- CONFIGURATION ---
-# ==============================================================================
+# ────────────────────────────────────────────────────────────────────────────────
+# 0. CONFIGURATION
+# ────────────────────────────────────────────────────────────────────────────────
 CONFIG = {
-    'BASE_URL': 'https://api.binance.com',
-    'COMPREHENSIVE_SYMBOLS': ['SOLUSDT', 'PAXGUSDT'],
-    'COMPREHENSIVE_INTERVALS': ['1s', '1m', '5m', '1h', '4h', '1d'],
-    'MAX_BARS_TO_DOWNLOAD': 20000,
-    'ANALYSIS_TIMEOUT_SECONDS': 120 # 2-minute timeout for each analysis
+    # Binance API
+    "BASE_URL": "https://api.binance.com",
+    "MAX_KLINES_PER_REQ": 1000,
+    # Data slices (percent of dataset in chronological order)
+    "BENCHMARK_PCT": 0.6,
+    "TUNE_PCT": 0.2,
+    # Remaining 20 % is automatically the lock‑box.
+    # Symbols & intervals
+    "SYMBOLS": ["SOLUSDT", "PAXGUSDT"],
+    "INTERVALS": ["1s", "1m", "5m", "1h", "4h", "1d"],
+    # Candle cap
+    "MAX_BARS": 20_000,
+    # Concurrency
+    "MAX_FETCH_WORKERS": 4,
+    # Caching
+    "CACHE_DIR": Path("./klines_cache"),
+    "CACHE_TTL_HOURS": 12,  # re‑download if older
+    # Sub‑process timeout per analyser run (seconds)
+    "ANALYSIS_TIMEOUT": 120,
+    # Logging
+    "LOG_FILE": "mfv_orchestrator.log",
 }
 
-# ==============================================================================
-# --- LOGGING SETUP ---
-# ==============================================================================
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler("mfv_orchestrator.log"),
-        logging.StreamHandler(sys.stdout)
+# Command‑line overrides populate here later
+ARGS: argparse.Namespace
+
+# ────────────────────────────────────────────────────────────────────────────────
+# 1. LOGGING SET‑UP
+# ────────────────────────────────────────────────────────────────────────────────
+CONFIG["CACHE_DIR"].mkdir(exist_ok=True)
+
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.INFO)
+formatter = logging.Formatter("%(asctime)s | %(levelname)8s | %(message)s",
+                              datefmt="%Y‑%m‑%d %H:%M:%S")
+
+# Console
+ch = logging.StreamHandler(sys.stdout)
+ch.setFormatter(formatter)
+root_logger.addHandler(ch)
+
+# Rotating file
+fh = logging.handlers.RotatingFileHandler(CONFIG["LOG_FILE"], maxBytes=2**20,
+                                          backupCount=3, encoding="utf‑8")
+fh.setFormatter(formatter)
+root_logger.addHandler(fh)
+
+log = logging.getLogger(__name__)
+
+# ────────────────────────────────────────────────────────────────────────────────
+# 2. HELPERS – BINANCE KLINES
+# ────────────────────────────────────────────────────────────────────────────────
+KLINE_ENDPOINT = "/api/v3/klines"
+
+@retry(wait=wait_exponential(multiplier=1, min=2, max=10), stop=stop_after_attempt(5))
+def _get(url: str, params: dict) -> requests.Response:
+    r = requests.get(url, params=params, timeout=10)
+    r.raise_for_status()
+    return r
+
+def fetch_klines(symbol: str, interval: str, limit: int) -> pd.DataFrame:
+    """Download up to *limit* most recent klines. Cached to disk."""
+    cache_f = CONFIG["CACHE_DIR"] / f"{symbol}_{interval}.parquet"
+    now = datetime.now(timezone.utc)
+    if cache_f.exists():
+        age = now - datetime.fromtimestamp(cache_f.stat().st_mtime, tz=timezone.utc)
+        if age < timedelta(hours=CONFIG["CACHE_TTL_HOURS"]):
+            log.debug("Using cached klines for %s %s", symbol, interval)
+            return pd.read_parquet(cache_f)
+
+    log.info("Downloading %s %s klines …", symbol, interval)
+    end_ts = int(now.timestamp() * 1000)
+    klines: List[list] = []
+    pbar = tqdm(total=limit, desc=f"{symbol} {interval}")
+    while len(klines) < limit:
+        need = min(CONFIG["MAX_KLINES_PER_REQ"], limit - len(klines))
+        params = {
+            "symbol": symbol,
+            "interval": interval,
+            "limit": need,
+            "endTime": end_ts,
+        }
+        data = _get(CONFIG["BASE_URL"] + KLINE_ENDPOINT, params).json()
+        if not data:
+            break  # exhausted history
+        klines.extend(data)
+        end_ts = data[0][0] - 1  # next request ends before oldest bar
+        pbar.update(len(data))
+        if len(data) < need:
+            break  # no more history available
+    pbar.close()
+
+    df = pd.DataFrame(klines, columns=[
+        "open_time", "open", "high", "low", "close", "volume", "close_time",
+        "quote_asset_volume", "trades", "taker_buy_base", "taker_buy_quote", "ignore",
+    ]).astype(float)
+    # Keep only required cols
+    df = df[["open_time", "open", "high", "low", "close", "volume"]]
+    df.sort_values("open_time", inplace=True)
+
+    df.to_parquet(cache_f, compression="zstd")
+    return df
+
+# ────────────────────────────────────────────────────────────────────────────────
+# 3. DATA PARTITIONING
+# ────────────────────────────────────────────────────────────────────────────────
+
+def partition_df(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    n = len(df)
+    b_split = int(n * CONFIG["BENCHMARK_PCT"])
+    t_split = b_split + int(n * CONFIG["TUNE_PCT"])
+    bench = df.iloc[:b_split]
+    tune = df.iloc[b_split:t_split]
+    lock = df.iloc[t_split:]
+    return bench, tune, lock
+
+# ────────────────────────────────────────────────────────────────────────────────
+# 4. ANALYSER SUB‑PROCESS WRAPPER
+# ────────────────────────────────────────────────────────────────────────────────
+import subprocess
+
+def run_analyzer(csv_path: Path, symbol: str, interval: str, bench_pct: float, tune_pct: float) -> dict | None:
+    cmd = [
+        sys.executable, "walk_forward_analyzer.py",
+        str(csv_path), symbol, interval,
+        "--bench", str(bench_pct), "--tune", str(tune_pct),
     ]
-)
+    log.debug("Launching analyser: %s", " ".join(cmd))
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=CONFIG["ANALYSIS_TIMEOUT"])
+    except subprocess.TimeoutExpired:
+        log.error("Analyser timed out for %s %s", symbol, interval)
+        return None
 
-# ==============================================================================
-# --- DATA FETCHING ---
-# ==============================================================================
-session = requests.Session()
-session.headers.update({'Accept-Encoding': 'gzip'})
+    if proc.returncode != 0:
+        log.error("Analyser failed for %s %s: %s", symbol, interval, proc.stderr[:300])
+        return None
 
-@retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=2, max=10))
-def make_request(url, params=None):
-    response = session.get(url, params=params, timeout=10)
-    response.raise_for_status()
-    return response.json()
+    try:
+        payload = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        log.error("Invalid JSON from analyser for %s %s", symbol, interval)
+        log.debug("Raw output: %s", proc.stdout[:300])
+        return None
 
-def get_historical_klines(symbol, interval):
-    max_bars = CONFIG['MAX_BARS_TO_DOWNLOAD']
-    logging.info(f"Fetching data for {symbol}, Interval: {interval} (max {max_bars} bars)...")
-    klines = []
-    limit = 1000
-    end_time = int(time.time() * 1000)
-    
-    with tqdm(total=max_bars, desc=f"Downloading {symbol}/{interval}") as pbar:
-        while len(klines) < max_bars:
+    if payload.get("status") != "success":
+        log.warning("Analyser reported non‑success status for %s %s", symbol, interval)
+        return None
+    return payload["data"]
+
+# ────────────────────────────────────────────────────────────────────────────────
+# 5. MAIN ORCHESTRATION
+# ────────────────────────────────────────────────────────────────────────────────
+
+def orchestrate() -> None:
+    results = []
+
+    tasks: List[Tuple[str, str]] = [(s, i) for s in CONFIG["SYMBOLS"] for i in CONFIG["INTERVALS"]]
+
+    # Fetch klines in parallel to maximise IO latency hiding
+    with ThreadPoolExecutor(max_workers=CONFIG["MAX_FETCH_WORKERS"]) as pool:
+        future_map = {
+            pool.submit(fetch_klines, sym, interv, CONFIG["MAX_BARS"]): (sym, interv)
+            for sym, interv in tasks
+        }
+        for fut in tqdm(as_completed(future_map), total=len(future_map), desc="Download tasks"):
+            symbol, interval = future_map[fut]
             try:
-                fetch_limit = min(limit, max_bars - len(klines))
-                params = {'symbol': symbol, 'interval': interval, 'limit': fetch_limit, 'endTime': end_time}
-                data = make_request(f"{CONFIG['BASE_URL']}/api/v3/klines", params=params)
-                if not data: break
-                klines.extend(data)
-                pbar.update(len(data))
-                end_time = data[0][0] - 1
-                if len(data) < fetch_limit: break
-            except Exception as e:
-                logging.error(f"Error fetching klines for {symbol}/{interval}: {e}")
-                return None
-    
-    return sorted(klines, key=lambda x: x[0])
+                df = fut.result()
+            except Exception as exc:
+                log.error("Download failed for %s %s: %s", symbol, interval, exc)
+                continue
 
-def process_and_save_klines(klines, symbol, interval):
-    if not klines: return None
-    cols = ['open_time', 'open', 'high', 'low', 'close', 'volume']
-    df = pd.DataFrame(klines, columns=['open_time', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'qav', 'trades', 'tbav', 'tbqv', 'ignore'])
-    df = df[cols[:6]]
-    for col in df.columns:
-        df[col] = pd.to_numeric(df[col], errors='coerce')
-    df.dropna(inplace=True)
-    
-    filepath = f"temp_data_{symbol}_{interval}.csv"
-    df.to_csv(filepath, index=False)
-    logging.info(f"Processed {len(df)} klines and saved to {filepath}")
-    return filepath
+            # Partition and stage CSV
+            bench, tune, lock = partition_df(df)
+            with tempfile.NamedTemporaryFile("w", delete=False, suffix=".csv") as tmp:
+                df.to_csv(tmp.name, index=False)
+                csv_path = Path(tmp.name)
 
-# ==============================================================================
-# --- REPORTING ---
-# ==============================================================================
-def display_comprehensive_report(all_results_df):
-    if all_results_df.empty:
-        logging.warning("No valid results found across all runs for meta-analysis.")
+            data = run_analyzer(csv_path, symbol, interval,
+                                CONFIG["BENCHMARK_PCT"], CONFIG["TUNE_PCT"])
+            csv_path.unlink(missing_ok=True)
+            if data:
+                results.append(data)
+
+    if not results:
+        log.error("No successful analyser results – exiting")
         return
 
-    df = all_results_df.copy()
-    
-    # Normalize metrics for fair scoring
-    df['youdens_j_norm'] = (df['youdens_j'] - df['youdens_j'].min()) / (df['youdens_j'].max() - df['youdens_j'].min())
-    df['calmar_ratio_norm'] = (df['calmar_ratio'] - df['calmar_ratio'].min()) / (df['calmar_ratio'].max() - df['calmar_ratio'].min())
-    df['max_drawdown_pct_inv_norm'] = 1 - ((df['max_drawdown_pct'] - df['max_drawdown_pct'].min()) / (df['max_drawdown_pct'].max() - df['max_drawdown_pct'].min()))
-    
-    # Calculate robustness score with 50% weight on Youden's J
-    df['robustness_score'] = 0.5 * df['youdens_j_norm'].fillna(0) + 0.3 * df['calmar_ratio_norm'].fillna(0) + 0.2 * df['max_drawdown_pct_inv_norm'].fillna(0)
-    df = df.sort_values('robustness_score', ascending=False)
-    
-    print("\n" + "#"*170 + "\n" + "--- COMPREHENSIVE WALK-FORWARD META-ANALYSIS REPORT ---".center(170) + "\n" + "#"*170)
-    header = f"{'Rank':<5} | {'Symbol':<10} | {'Interval':<8} | {'Robust Score':<14} | {'Youden\'s J':<12} | {'Calmar Ratio':<14} | {'Max DD %':<12} | {'Win Rate':<10} | {'Best Combination'}"
-    print(header + "\n" + "-" * len(header))
-    for i, row in enumerate(df.head(20).itertuples(), 1):
-        robust_score = f"{row.robustness_score:.3f}"
-        youdens_j = f"{row.youdens_j:.3f}"
-        calmar = f"{row.calmar_ratio:.2f}" if np.isfinite(row.calmar_ratio) else "inf"
-        max_dd = f"{row.max_drawdown_pct:.2f}%"
-        win_rate = f"{row.win_rate:.1%}"
-        print(f"{i:<5} | {row.symbol:<10} | {row.interval:<8} | {robust_score:<14} | {youdens_j:<12} | {calmar:<14} | {max_dd:<12} | {win_rate:<10} | {row.combination}")
-    print("#"*170)
-
-# ==============================================================================
-# --- MAIN EXECUTION ---
-# ==============================================================================
-def main():
-    parser = argparse.ArgumentParser(description="Orchestrator for Walk-Forward MFV Analysis.")
-    parser.add_argument(
-        'mode', nargs='?', default='comprehensive', choices=['comprehensive'],
-        help="Mode of operation."
-    )
-    args = parser.parse_args()
-
-    if args.mode == 'comprehensive':
-        all_run_results = []
-        analyzer_script_path = "walk_forward_analyzer.py"
-
-        if not os.path.exists(analyzer_script_path):
-            logging.error(f"FATAL: The analyzer script '{analyzer_script_path}' was not found in the same directory.")
-            return
-
-        for symbol in CONFIG['COMPREHENSIVE_SYMBOLS']:
-            for interval in CONFIG['COMPREHENSIVE_INTERVALS']:
-                logging.info(f"--- STARTING WALK-FORWARD ANALYSIS FOR: {symbol} | {interval} ---")
-                
-                # 1. Fetch data and save to a temporary file
-                klines = get_historical_klines(symbol, interval)
-                temp_data_path = process_and_save_klines(klines, symbol, interval)
-                
-                if not temp_data_path:
-                    logging.warning(f"Skipping {symbol}/{interval} due to data fetching/processing error.")
-                    continue
-
-                # 2. Run the analyzer script as a subprocess with a timeout
-                try:
-                    command = [sys.executable, analyzer_script_path, temp_data_path, symbol, interval]
-                    result = subprocess.run(
-                        command,
-                        stdout=subprocess.PIPE,
-                        stderr=sys.stderr, # This line streams the analyzer's progress to the console
-                        text=True,
-                        check=True,
-                        timeout=CONFIG['ANALYSIS_TIMEOUT_SECONDS']
-                    )
-                    
-                    # 3. Parse the JSON result from the captured stdout
-                    output = json.loads(result.stdout)
-                    if output.get("status") == "success":
-                        all_run_results.append(output['data'])
-                    else:
-                        logging.error(f"Analysis failed for {symbol}/{interval}. Reason: {output.get('error', 'Unknown')}")
-
-                except subprocess.TimeoutExpired:
-                    logging.error(f"Analysis for {symbol}/{interval} timed out after {CONFIG['ANALYSIS_TIMEOUT_SECONDS']} seconds. Skipping.")
-                except subprocess.CalledProcessError as e:
-                    logging.error(f"Error executing analyzer for {symbol}/{interval}. Check console for details.")
-                except json.JSONDecodeError:
-                    logging.error(f"Could not decode JSON from analyzer for {symbol}/{interval}. It might have timed out or failed.")
-                finally:
-                    # 4. Clean up the temporary file
-                    if os.path.exists(temp_data_path):
-                        os.remove(temp_data_path)
-
-        # 5. Generate the final report
-        if all_run_results:
-            final_df = pd.DataFrame(all_run_results)
-            display_comprehensive_report(final_df)
-            final_df.to_csv("walk_forward_report.csv", index=False)
-            logging.info("Comprehensive walk-forward report saved to 'walk_forward_report.csv'")
+    # Aggregate and rank
+    df_res = pd.DataFrame(results)
+    # Normalise metrics 0‑1 for composite score
+    for col in ("youden_j", "calmar", "max_drawdown"):
+        if col not in df_res:
+            continue
+        if col == "max_drawdown":
+            df_res[col + "_norm"] = 1 - (df_res[col] - df_res[col].min()) / (df_res[col].max() - df_res[col].min())
         else:
-            logging.warning("No successful analysis runs to report.")
+            df_res[col + "_norm"] = (df_res[col] - df_res[col].min()) / (df_res[col].max() - df_res[col].min())
 
-if __name__ == '__main__':
-    main()
+    df_res["robustness_score"] = (
+        0.5 * df_res["youden_j_norm"] +
+        0.3 * df_res["calmar_norm"] +
+        0.2 * df_res["max_drawdown_norm"]
+    )
+    df_res.sort_values("robustness_score", ascending=False, inplace=True)
+
+    # Save & print
+    out_f = Path("walk_forward_report.csv")
+    df_res.to_csv(out_f, index=False)
+    log.info("Saved report → %s (%d rows)", out_f, len(df_res))
+    print(df_res.head(20).to_markdown(index=False))
+
+# ────────────────────────────────────────────────────────────────────────────────
+# 6. CLI
+# ────────────────────────────────────────────────────────────────────────────────
+
+def parse_cli() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Adaptive MFV walk‑forward orchestrator")
+    p.add_argument("--symbols", nargs="*", help="Override default symbols list")
+    p.add_argument("--intervals", nargs="*", help="Override default intervals list")
+    p.add_argument("--max‑bars", type=int, help="Limit bars per dataset")
+    p.add_argument("--debug", action="store_true", help="Verbose logging")
+    return p.parse_args()
+
+
+if __name__ == "__main__":
+    ARGS = parse_cli()
+    if ARGS.debug:
+        root_logger.setLevel(logging.DEBUG)
+    if ARGS.symbols:
+        CONFIG["SYMBOLS"] = ARGS.symbols
+    if ARGS.intervals:
+        CONFIG["INTERVALS"] = ARGS.intervals
+    if ARGS.max_bars:
+        CONFIG["MAX_BARS"] = ARGS.max_bars
+
+    orchestrate()

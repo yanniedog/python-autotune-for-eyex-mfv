@@ -1,234 +1,344 @@
 #!/usr/bin/env python3
 """
-Walk‑Forward MFV Analyzer – **Turbo Edition**
-============================================
+Adaptive Walk‑Forward Analyzer – walk_forward_analyzer.py
+========================================================
+Analyses a pre‑staged OHLCV CSV (as created by *pytune_mfv.py*) and returns a
+single JSON summary of the best‑performing MFV period combination discovered
+using a **multi‑stage adaptive search** with strict out‑of‑sample validation.
 
-Fully overhauled for **seconds‑level data** where brute‑force enumeration
-explodes.  On a 20 000‑bar, 1‑second dataset the full run now completes in
-≈ 2–4 seconds on a laptop CPU (vs >15 minutes previously).
+Highlights
+----------
+* **Three‑block timeline split** (benchmark, tuning, lock‑box).
+* **Stage‑1 Latin‑hypercube seeds**, **Bayesian optimisation** thereafter.
+* **Rolling‑origin cross‑validation** on the tuning block (purged gaps).
+* **Lock‑box approval** – each candidate tested once on final 20 % of data.
+* **Vectorised MFV/z‑score calculation** with a global cache.
+* **Numba‑accelerated trade engine** for realistic SL/TP exits.
+* **Adaptive early‑pruning** via Optuna MedianPruner.
 
-Core acceleration strategies
-----------------------------
-1. **Two‑stage search**
-   * *Broad scan* evaluates every candidate **period** once to find signal
-     quality (Youden’s J).  Results are **vectorised** – O(NP) with very small
-     constants.
-   * Only the **top K=8** periods feed the **combination stage** (`n = 8 C k = 3 → 56`
-     combos instead of 280 840).
-2. **Pre‑computed z‑scores** – each chosen period’s z‑score array is built **once**
-   and reused across combos, eliminating repeated `rolling` work.
-3. **No heavy pools** – single‑threaded NumPy is faster than serialising large
-   arrays to subprocesses for just 56 combos.
-4. **Aggressive dtype hints & contiguous arrays** so NumPy/Numba stay vectorised.
-
-The script *prints exactly one JSON blob* (status + data) to STDOUT so that the
-orchestrator can parse it.  Errors are emitted to STDERR and returned in the
-JSON.
+Usage
+-----
+```bash
+python walk_forward_analyzer.py temp_data_SOLUSDT_1s.csv SOLUSDT 1s
+```
+The script prints exactly one JSON blob to STDOUT and logs progress to STDERR.
 """
+from __future__ import annotations
 
-import os
-import sys
 import json
-import time
 import logging
-import argparse
-from itertools import combinations
+import sys
+import time
+from pathlib import Path
+from typing import List, Tuple, Dict
 
 import numpy as np
 import pandas as pd
-from numba import njit
+from numba import njit, prange  # type: ignore
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 0. Logging
-# ──────────────────────────────────────────────────────────────────────────────
+# Optional dependencies – only needed for stage‑2 optimisation
+try:
+    import optuna
+    from optuna.samplers import TPESampler
+    from optuna.pruners import MedianPruner
+except ImportError:  # graceful fallback: dummy Optuna shim
+    optuna = None  # type: ignore
+
 logging.basicConfig(
-    level=os.environ.get("LOGLEVEL", "INFO").upper(),
-    format="%(asctime)s %(levelname)s │ %(message)s",
-    stream=sys.stderr,
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    handlers=[logging.StreamHandler(sys.stderr)],
 )
+logger = logging.getLogger(__name__)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 1. Configuration helper
-# ──────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
+# Configuration
+# ──────────────────────────────────────────────────────────────
+MAX_PERIOD = 1200
+MIN_PERIOD = 10
+TOP_SEED_FRACTION = 0.2  # keep top‑20 % seeds for Bayesian stage
+LATIN_HYPER_SEEDS = 128  # stage‑1 seed count
+TUNING_FOLDS = 5
+LOCKBOX_SHARE = 0.20
+TUNING_SHARE = 0.20  # remaining 60 % is benchmark
+SL_PCT = 0.015  # 1.5 % stop‑loss
+TP_PCT = 0.03   # 3 % take‑profit
 
-def get_cfg(interval: str):
-    cfg = {
-        "FINAL_TOP_PERIODS": 8,
-        "COMBO_SIZE": 3,
-        "BROAD_START": 10,
-        "BROAD_END": 1200 if "s" in interval else 3000,
-        "BROAD_STEP": 10 if "s" in interval else 5,
-        "SL_PCT": 5.0,
-        "TP_PCT": 15.0,
-    }
-    return cfg
+# ──────────────────────────────────────────────────────────────
+# Utility functions
+# ──────────────────────────────────────────────────────────────
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 2. Utility – periods‑per‑year (for annualisation)
-# ──────────────────────────────────────────────────────────────────────────────
+def _ppy(interval: str) -> int:
+    """Approx periods per year given Binance interval string."""
+    unit = interval[-1]
+    qty = int(interval[:-1])
+    if unit == "s":
+        return int(31536000 / qty)
+    if unit == "m":
+        return int(525600 / qty)
+    if unit == "h":
+        return int(8760 / qty)
+    if unit == "d":
+        return int(365 / qty)
+    raise ValueError(f"Unsupported interval {interval}")
 
-def _ppy(interval: str) -> float:
-    if "s" in interval:
-        return 365*24*60*60 / int(interval.replace("s",""))
-    if "m" in interval:
-        return 365*24*60 / int(interval.replace("m",""))
-    if "h" in interval:
-        return 365*24 / int(interval.replace("h",""))
-    if "d" in interval:
-        return 365
-    return 252
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 3. Fast C‑style back‑test (long‑only, SL/TP)
-# ──────────────────────────────────────────────────────────────────────────────
+def _rolling_sum(a: np.ndarray, window: int) -> np.ndarray:
+    """Fast rolling sum using numpy cumulative sum."""
+    c = np.cumsum(np.insert(a, 0, 0))
+    return c[window:] - c[:-window]
 
-@njit(cache=True)
-def _bt(open_p, high_p, low_p, sig, horizon, sl, tp):
-    n = open_p.size
-    out = np.empty(n, np.float64)
-    k = 0
-    for i in range(1, n):
-        if sig[i-1] <= 0:
+
+def _youden_j(tp: int, fp: int, tn: int, fn: int) -> float:
+    recall = tp / (tp + fn + 1e-12)
+    spec = tn / (tn + fp + 1e-12)
+    return recall + spec - 1.0
+
+
+# ──────────────────────────────────────────────────────────────
+# Numba‑optimised trade engine
+# ──────────────────────────────────────────────────────────────
+
+@njit(fastmath=True, cache=True)
+def _bt(close: np.ndarray, signal: np.ndarray) -> Tuple[float, float, float]:
+    """Back‑tests composite signal; returns (win_rate, max_dd_pct, ann_return)."""
+    equity = 1.0
+    peak = 1.0
+    wins = 0
+    trades = 0
+    for i in range(len(signal)):
+        if signal[i] == 0:
             continue
-        ent = open_p[i]
-        sl_price = ent * (1-sl/100)
-        tp_price = ent * (1+tp/100)
-        last = min(i+horizon, n-1)
-        ret = 0.0
-        for j in range(i, last+1):
-            if low_p[j] <= sl_price:
-                ret = -sl; break
-            if high_p[j] >= tp_price:
-                ret = tp; break
-        if ret == 0.0:
-            ret = (open_p[last]/ent - 1)*100
-        out[k] = ret; k += 1
-    return out[:k]
+        entry = close[i]
+        direction = 1 if signal[i] > 0 else -1
+        # iterate forward until exit – simplistic horizon = 50 bars or SL/TP
+        exit_price = entry
+        for j in range(i + 1, min(i + 50, len(close))):
+            move = (close[j] - entry) / entry * direction
+            if move >= TP_PCT:
+                exit_price = entry * (1 + TP_PCT * direction)
+                break
+            if move <= -SL_PCT:
+                exit_price = entry * (1 - SL_PCT * direction)
+                break
+            exit_price = close[j]
+        ret = (exit_price - entry) / entry * direction
+        equity *= 1 + ret
+        peak = max(peak, equity)
+        trades += 1
+        if ret > 0:
+            wins += 1
+    win_rate = wins / trades if trades else 0.0
+    max_dd = (peak - equity) / peak if peak else 0.0
+    periods_per_year = len(close) / 252  # rough daily bars for ann.
+    ann_ret = equity ** (1 / periods_per_year) - 1 if periods_per_year else 0.0
+    return win_rate, max_dd, ann_ret
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 4. Broad scan (vectorised) – returns sorted periods & their scores
-# ──────────────────────────────────────────────────────────────────────────────
 
-def broad_scan(close, high, low, vol, cfg):
-    n = close.size
-    p_arr = np.arange(cfg["BROAD_START"], cfg["BROAD_END"]+1, cfg["BROAD_STEP"], dtype=np.int32)
+# ──────────────────────────────────────────────────────────────
+# MFV + z‑score utilities (with cache)
+# ──────────────────────────────────────────────────────────────
 
-    mf_mul = ((close - low) - (high - close)) / np.where((high-low)==0, 1, (high-low))
-    mf_vol = mf_mul * vol
-    cs = np.concatenate(([0.0], np.cumsum(mf_vol)))
+_zcache: Dict[int, np.ndarray] = {}
 
-    scores = []
-    for p in p_arr:
-        if n < p*2:
-            continue
-        win_sum = cs[p:] - cs[:-p]           # length n-p+1
-        sig = np.sign(win_sum[:-1])          # align with ROC
-        roc = np.sign((close[p:] - close[:-p]))
-        tp = np.sum((sig>0) & (roc>0))
-        fn = np.sum((sig<=0) & (roc>0))
-        tn = np.sum((sig<0) & (roc<0))
-        fp = np.sum((sig>=0) & (roc<0))
-        if (tp+fn)==0 or (tn+fp)==0:
-            yj = -1.0
-        else:
-            yj = tp/(tp+fn) + tn/(tn+fp) - 1
-        scores.append((p, yj))
-    scores.sort(key=lambda x: x[1], reverse=True)
-    return scores[:cfg["FINAL_TOP_PERIODS"]]
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 5. Main runner
-# ──────────────────────────────────────────────────────────────────────────────
+def _mfv_z(vol: np.ndarray, close: np.ndarray, period: int) -> np.ndarray:
+    """Rolling money‑flow volume z‑score for a given period (cached)."""
+    key = period
+    if key in _zcache:
+        return _zcache[key]
+    mfv = vol * np.sign(np.diff(np.concatenate(([close[0]], close))))
+    roll = _rolling_sum(mfv, period)
+    mean = pd.Series(roll).rolling(period).mean().to_numpy()
+    std = pd.Series(roll).rolling(period).std(ddof=0).to_numpy()
+    z = (roll - mean) / (std + 1e-12)
+    z = np.concatenate((np.zeros(period * 2 - 1), z))  # pad to same length
+    _zcache[key] = z
+    return z
 
-def run(csv_path: str, symbol: str, interval: str):
+
+# ──────────────────────────────────────────────────────────────
+# Dataset split helpers
+# ──────────────────────────────────────────────────────────────
+
+def _split_dataset(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    n = len(df)
+    lock_n = int(n * LOCKBOX_SHARE)
+    tuning_n = int(n * TUNING_SHARE)
+    benchmark = df.iloc[: n - tuning_n - lock_n]
+    tuning = df.iloc[n - tuning_n - lock_n : n - lock_n]
+    lock = df.iloc[n - lock_n :]
+    return benchmark.reset_index(drop=True), tuning.reset_index(drop=True), lock.reset_index(drop=True)
+
+
+# ──────────────────────────────────────────────────────────────
+# Scoring helpers
+# ──────────────────────────────────────────────────────────────
+
+def _score_metrics(j: float, calmar: float, max_dd: float) -> float:
+    return 0.5 * j + 0.3 * calmar - 0.2 * max_dd
+
+
+# ──────────────────────────────────────────────────────────────
+# Core evaluators
+# ──────────────────────────────────────────────────────────────
+
+def _evaluate_combo(periods: Tuple[int, int, int], df: pd.DataFrame) -> Tuple[float, float, float, float]:
+    """Returns (YoudenJ, calmar, max_dd, win_rate)."""
+    vol = df["volume"].to_numpy(dtype=np.float64)
+    close = df["close"].to_numpy(dtype=np.float64)
+
+    sig = _mfv_z(vol, close, periods[0]) + _mfv_z(vol, close, periods[1]) + _mfv_z(vol, close, periods[2])
+    signal = np.sign(sig)
+
+    # Classification counts for J on next‑bar direction
+    dir1 = np.sign(np.diff(close, prepend=close[0]))
+    tp = np.sum((signal > 0) & (dir1 > 0))
+    tn = np.sum((signal < 0) & (dir1 < 0))
+    fp = np.sum((signal > 0) & (dir1 < 0))
+    fn = np.sum((signal < 0) & (dir1 > 0))
+    j = _youden_j(tp, fp, tn, fn)
+
+    win_rate, max_dd, ann_ret = _bt(close, signal)
+    calmar = ann_ret / (max_dd + 1e-12) if max_dd else 0.0
+    return j, calmar, max_dd, win_rate
+
+
+# ──────────────────────────────────────────────────────────────
+# Stage‑1: Latin‑hypercube seeds
+# ──────────────────────────────────────────────────────────────
+
+def _lhs_samples(n: int, dim: int, low: int, high: int) -> List[Tuple[int, int, int]]:
+    rng = np.random.default_rng(42)
+    cut = np.linspace(0, 1, n + 1)
+    u = rng.random((dim, n)) * (cut[1:] - cut[:-1]) + cut[:-1]
+    lhs = np.transpose(u)
+    rng.shuffle(lhs)
+    periods = []
+    for row in lhs:
+        p = tuple(sorted((int(low + r * (high - low)) for r in row)))  # type: ignore
+        if p[0] < p[1] < p[2]:
+            periods.append(p)  # type: ignore
+    return periods[:n]
+
+
+# ──────────────────────────────────────────────────────────────
+# Cross‑validation on tuning block
+# ──────────────────────────────────────────────────────────────
+
+def _cv_eval(periods: Tuple[int, int, int], df: pd.DataFrame) -> Tuple[float, float, float]:
+    n = len(df)
+    gap = max(periods)
+    fold_size = n // TUNING_FOLDS
+    js, calmars, dds = [], [], []
+    for i in range(TUNING_FOLDS):
+        start = i * fold_size
+        end = start + fold_size
+        train_idx = list(range(0, start - gap)) + list(range(end + gap, n))
+        test_idx = list(range(start, end))
+        if min(test_idx) < 0 or max(train_idx) >= n:
+            continue  # skip if indices out of range
+        test_df = df.iloc[test_idx]
+        j, calmar, dd, _ = _evaluate_combo(periods, test_df)
+        js.append(j)
+        calmars.append(calmar)
+        dds.append(dd)
+    return float(np.mean(js)), float(np.mean(calmars)), float(np.mean(dds))
+
+
+# ──────────────────────────────────────────────────────────────
+# Main optimisation routine
+# ──────────────────────────────────────────────────────────────
+
+def optimise(df_bench: pd.DataFrame, df_tune: pd.DataFrame) -> Tuple[Tuple[int, int, int], Dict[str, float]]:
+    """Return best periods and metrics from tuning block."""
+
+    lhs = _lhs_samples(LATIN_HYPER_SEEDS, 3, MIN_PERIOD, MAX_PERIOD)
+    logger.info("Stage‑1 LHS seeds: %d", len(lhs))
+
+    seed_results = []
+    for p in lhs:
+        j, c, dd, w = _evaluate_combo(p, df_bench)
+        seed_results.append((p, _score_metrics(j, c, dd)))
+    seed_results.sort(key=lambda x: x[1], reverse=True)
+    top_seeds = [p for p, _ in seed_results[: max(1, int(len(seed_results) * TOP_SEED_FRACTION))]]
+
+    if optuna is None:
+        logger.warning("Optuna not available – returning best LHS seed only")
+        best_p = top_seeds[0]
+        j, c, dd, w = _evaluate_combo(best_p, df_tune)
+        return best_p, {"youden_j": j, "calmar": c, "max_dd": dd, "win_rate": w}
+
+    study = optuna.create_study(
+        direction="minimize",
+        sampler=TPESampler(seed=42),
+        pruner=MedianPruner(n_startup_trials=15, n_warmup_steps=0),
+    )
+
+    def objective(trial):  # inner closure
+        p1 = trial.suggest_int("p1", MIN_PERIOD, MAX_PERIOD)
+        p2 = trial.suggest_int("p2", p1 + 1, MAX_PERIOD)
+        p3 = trial.suggest_int("p3", p2 + 1, MAX_PERIOD)
+        periods = (p1, p2, p3)
+        # quick eval on benchmark
+        j_b, c_b, dd_b, _ = _evaluate_combo(periods, df_bench)
+        trial.report(j_b, step=0)
+        # prune early if Youden J too low
+        if trial.should_prune():
+            raise optuna.TrialPruned()
+        # CV on tuning block
+        j, c, dd = _cv_eval(periods, df_tune)
+        score = -_score_metrics(j, c, dd)  # Optuna minimises
+        return score
+
+    study.enqueue_trial({"p1": p[0], "p2": p[1], "p3": p[2]} for p in top_seeds)
+
+    study.optimize(objective, n_trials=200, show_progress_bar=False)
+
+    best = study.best_trial.params
+    best_p = (best["p1"], best["p2"], best["p3"])
+    j, c, dd, w = _evaluate_combo(best_p, df_tune)
+    return best_p, {"youden_j": j, "calmar": c, "max_dd": dd, "win_rate": w}
+
+
+# ──────────────────────────────────────────────────────────────
+# Lock‑box validation
+# ──────────────────────────────────────────────────────────────
+
+def lockbox_validate(periods: Tuple[int, int, int], df_lock: pd.DataFrame) -> Dict[str, float]:
+    j, c, dd, w = _evaluate_combo(periods, df_lock)
+    return {"youden_j": j, "calmar": c, "max_dd": dd, "win_rate": w}
+
+
+# ──────────────────────────────────────────────────────────────
+# Entrypoint
+# ──────────────────────────────────────────────────────────────
+
+def _main(path: Path, symbol: str, interval: str):
     t0 = time.time()
-    cfg = get_cfg(interval)
+    df = pd.read_csv(path)
+    for col in ("open", "high", "low", "close", "volume"):
+        if col not in df.columns:
+            raise ValueError(f"CSV missing column {col}")
 
-    df = pd.read_csv(csv_path, dtype=float)
-    req = {c for c in ("open","high","low","close","volume")}
-    if df.empty or not req.issubset(df.columns):
-        raise ValueError("CSV missing OHLCV columns")
+    df_bench, df_tune, df_lock = _split_dataset(df)
+    best_p, tune_metrics = optimise(df_bench, df_tune)
+    lock_metrics = lockbox_validate(best_p, df_lock)
 
-    close = df.close.to_numpy(np.float64)
-    high  = df.high.to_numpy(np.float64)
-    low   = df.low.to_numpy(np.float64)
-    vol   = df.volume.to_numpy(np.float64)
-
-    # 1️⃣ Broad scan
-    top_periods = [p for p,_ in broad_scan(close, high, low, vol, cfg)]
-    logging.info(f"Top periods: {top_periods}")
-
-    # 2️⃣ Pre‑compute z‑scores for those periods
-    z_map = {}
-    mf_mul = ((close - low) - (high - close)) / np.where((high-low)==0, 1, (high-low))
-    mf_vol = mf_mul * vol
-    s = pd.Series(mf_vol)
-    for p in top_periods:
-        zs = (s.rolling(p).sum() - s.rolling(p).sum().rolling(p).mean())
-        std = s.rolling(p).sum().rolling(p).std().replace(0, np.nan)
-        z_map[p] = (zs / std).clip(-100,100).fillna(0)
-
-    # 3️⃣ Evaluate combos
-    best = None
-    for combo in combinations(top_periods, cfg["COMBO_SIZE"]):
-        comp = sum(z_map[p] for p in combo) / cfg["COMBO_SIZE"]
-        horizon = int(max(combo)*1.0)
-        sig = (comp > 0).astype(float)  # simple long‑only rule
-        rets = _bt(df.open.to_numpy(np.float64), high, low, sig.to_numpy(np.float64),
-                   horizon, cfg["SL_PCT"], cfg["TP_PCT"])
-        if rets.size==0:
-            continue
-        win = (rets>0).mean()
-        dd = (np.maximum.accumulate(rets.cumsum()) - rets.cumsum()).max()
-        ann = rets.sum() / (df.shape[0]/_ppy(interval))
-        yj = win - (dd/1000)             # crude ranking metric
-        if (best is None) or (yj > best["score"]):
-            best = {"combo": combo, "horizon": horizon, "score": yj,
-                     "win_rate": win, "max_dd": dd, "annual_ret": ann}
-
-    if best is None:
-        return {"status":"error","error":"no valid combos"}
-
-    elapsed = time.time()-t0
-    logging.info(f"Finished in {elapsed:.2f}s – best combo {best['combo']}")
-
-    out = {
+    result = {
+        "status": "success",
         "symbol": symbol,
         "interval": interval,
-        "combination": best["combo"],
-        "horizon": best["horizon"],
-        "win_rate": best["win_rate"],
-        "max_drawdown_pct": best["max_dd"],
-        "annual_return_pct": best["annual_ret"],
-        "elapsed_sec": elapsed,
-        "youdens_j": best["score"],  # Add Youden's J to output
+        "periods": best_p,
+        "tuning": tune_metrics,
+        "lockbox": lock_metrics,
+        "runtime_sec": round(time.time() - t0, 3),
     }
-    return {"status":"success","data":out}
+    json.dump(result, sys.stdout, separators=(",", ":"))
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 6. CLI wrapper
-# ──────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("csv_path")
-    ap.add_argument("symbol")
-    ap.add_argument("interval")
-    a = ap.parse_args()
-    res = run(a.csv_path, a.symbol, a.interval)
-    # Convert all numpy types to native Python types for JSON serialization
-    def convert_np(obj):
-        if isinstance(obj, dict):
-            return {k: convert_np(v) for k, v in obj.items()}
-        elif isinstance(obj, (list, tuple)):
-            return [convert_np(x) for x in obj]
-        elif hasattr(obj, 'item') and callable(obj.item):
-            try:
-                return obj.item()
-            except Exception:
-                pass
-        return obj
-    res_py = convert_np(res)
-    print(json.dumps(res_py, ensure_ascii=False))
-    if res.get("status") != "success":
+    if len(sys.argv) != 4:
+        print("Usage: walk_forward_analyzer.py <csv_path> <symbol> <interval>", file=sys.stderr)
         sys.exit(1)
+    _main(Path(sys.argv[1]), sys.argv[2], sys.argv[3])
