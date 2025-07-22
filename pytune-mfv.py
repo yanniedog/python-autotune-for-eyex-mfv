@@ -56,6 +56,8 @@ try:
 except ImportError:
     TABULATE_AVAILABLE = False
 
+import matplotlib.pyplot as plt
+
 # ────────────────────────────────────────────────────────────────────────────────
 # 0. CONFIGURATION
 # ────────────────────────────────────────────────────────────────────────────────
@@ -275,6 +277,25 @@ def orchestrate():
             print(f"[ERROR] Download failed for {sym} {interv}: {exc}")
     save_adaptive_space(adaptive_space)
     try:
+        # --- Real-time plotting setup ---
+        plt.ion()
+        metrics_to_plot = [
+            "robustness_score",
+            "tuning_youden_j",
+            "tuning_calmar",
+            "tuning_max_dd",
+            "lockbox_youden_j",
+            "lockbox_calmar",
+            "lockbox_max_dd"
+        ]
+        fig, ax = plt.subplots()
+        fig.suptitle("Average % Delta Across All Symbol/Intervals")
+        report_file = Path("walk_forward_report.csv")
+        # If the report file exists, load it to continue history
+        if report_file.exists():
+            full_history = pd.read_csv(report_file)
+        else:
+            full_history = pd.DataFrame()
         while True:
             iteration += 1
             print(f"\n[Iteration {iteration}] Starting...")
@@ -362,10 +383,12 @@ def orchestrate():
             else:
                 log.warning("No normalized columns found for robustness_score calculation.")
                 print("[WARN] No normalized columns found for robustness_score calculation.")
-            # Save & print CSV (append or overwrite)
-            out_f = Path("walk_forward_report.csv")
-            df_res.to_csv(out_f, index=False, float_format='%.6g')
-            print(f"[Iteration {iteration}] Updated report → {out_f} ({len(df_res)} rows)")
+            # Append this iteration's results to full_history
+            df_res["iteration"] = iteration
+            full_history = pd.concat([full_history, df_res], ignore_index=True)
+            # Save the full history to CSV (append mode, but keep header only once)
+            full_history.to_csv(report_file, index=False, float_format='%.6g')
+            print(f"[Iteration {iteration}] Updated report → {report_file} ({len(df_res)} rows this iter, {len(full_history)} total)")
             # Show performance improvement
             best_score = df_res["robustness_score"].max() if "robustness_score" in df_res else None
             avg_score = df_res["robustness_score"].mean() if "robustness_score" in df_res else None
@@ -396,32 +419,47 @@ def orchestrate():
                 table.append(row_out)
                 # Save for next iteration
                 prev_rows[key] = {c: row.get(c, None) for c in cols}
-            headers = cols + delta_cols
-            print("\n[Iteration {}] Full Metrics Table:".format(iteration))
-            if TABULATE_AVAILABLE:
-                print(tabulate(table, headers=headers, floatfmt=".4g"))
-            else:
-                # Fallback: plain text
-                print("\t".join(headers))
-                for row in table:
-                    print("\t".join(str(x) for x in row))
-            if prev_best_score is not None and best_score is not None:
-                print(f"[Iteration {iteration}] Best robustness score: {best_score:.4f} (Δ {best_score - prev_best_score:+.4f})")
-            elif best_score is not None:
-                print(f"[Iteration {iteration}] Best robustness score: {best_score:.4f}")
-            if prev_avg_score is not None and avg_score is not None:
-                print(f"[Iteration {iteration}] Avg robustness score: {avg_score:.4f} (Δ {avg_score - prev_avg_score:+.4f})")
-            elif avg_score is not None:
-                print(f"[Iteration {iteration}] Avg robustness score: {avg_score:.4f}")
-            prev_best_score = best_score
-            prev_avg_score = avg_score
-            all_results.append(df_res)
+                # --- Update plot data ---
+                for i, metric in enumerate(metrics_to_plot, start=3):
+                    val = row.get(metric, None)
+                    if val is not None:
+                        # This part of the plot data is no longer needed for the average delta plot
+                        # as the plot now reads from the full history.
+                        # Keeping it for now, but it will be removed in a future edit.
+                        pass
+                # --- Plot average % delta for each metric over all iterations ---
+                ax.clear()
+                # For each metric, build a list of average % delta per iteration
+                for metric in metrics_to_plot:
+                    # For each iteration, get all values for this metric
+                    avg_pct_deltas = []
+                    iter_nums = sorted(full_history["iteration"].unique())
+                    for iter_num in iter_nums:
+                        vals = full_history.loc[full_history["iteration"] == iter_num, metric].dropna().values
+                        if len(vals) == 0:
+                            avg_pct_deltas.append(None)
+                            continue
+                        y0 = vals[0] if vals[0] != 0 else 1e-8
+                        avg_pct_delta = sum((v - y0) / abs(y0) * 100 for v in vals) / len(vals)
+                        avg_pct_deltas.append(avg_pct_delta)
+                    # Only plot if we have at least 2 points
+                    if sum(x is not None for x in avg_pct_deltas) > 1:
+                        ax.plot(iter_nums, [x if x is not None else float('nan') for x in avg_pct_deltas], label=metric)
+                ax.set_xlabel("Iteration")
+                ax.set_ylabel("Average % Delta from Iter 1")
+                ax.legend(loc="best", fontsize="small")
+                ax.grid(True)
+                fig.canvas.draw()
+                fig.canvas.flush_events()
             print(f"[Iteration {iteration}] Press Ctrl+C to stop or wait for next refinement...\n")
     except KeyboardInterrupt:
         print("\n[STOPPED] Continual refinement stopped by user.")
         print(f"Total iterations completed: {iteration}")
         print(f"Final report: walk_forward_report.csv")
         return
+    # At the end of orchestrate(), after KeyboardInterrupt or loop exit
+    plt.ioff()
+    plt.show()
 
 # ────────────────────────────────────────────────────────────────────────────────
 # 6. CLI
