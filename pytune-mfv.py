@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import logging.handlers
 import os
 import sys
 import tempfile
@@ -37,6 +38,16 @@ import pandas as pd
 import requests
 from tenacity import retry, stop_after_attempt, wait_exponential
 from tqdm import tqdm
+
+import warnings
+import logging
+import sys
+try:
+    import pyarrow
+    import fastparquet
+except ImportError as e:
+    logging.error('Missing required parquet engine: pyarrow or fastparquet. Please install them.')
+    sys.exit(1)
 
 # ────────────────────────────────────────────────────────────────────────────────
 # 0. CONFIGURATION
@@ -90,6 +101,8 @@ fh.setFormatter(formatter)
 root_logger.addHandler(fh)
 
 log = logging.getLogger(__name__)
+
+logging.basicConfig(filename='mfv_orchestrator.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', filemode='w')
 
 # ────────────────────────────────────────────────────────────────────────────────
 # 2. HELPERS – BINANCE KLINES
@@ -167,7 +180,6 @@ def run_analyzer(csv_path: Path, symbol: str, interval: str, bench_pct: float, t
     cmd = [
         sys.executable, "walk_forward_analyzer.py",
         str(csv_path), symbol, interval,
-        "--bench", str(bench_pct), "--tune", str(tune_pct),
     ]
     log.debug("Launching analyser: %s", " ".join(cmd))
     try:
@@ -191,7 +203,11 @@ def run_analyzer(csv_path: Path, symbol: str, interval: str, bench_pct: float, t
     if payload.get("status") != "success":
         log.warning("Analyser reported non‑success status for %s %s", symbol, interval)
         return None
-    return payload["data"]
+    if "data" in payload:
+        return payload["data"]
+    else:
+        log.warning("Analyser payload missing 'data' key for %s %s: %s", symbol, interval, payload)
+        return payload
 
 # ────────────────────────────────────────────────────────────────────────────────
 # 5. MAIN ORCHESTRATION
@@ -235,20 +251,32 @@ def orchestrate() -> None:
     # Aggregate and rank
     df_res = pd.DataFrame(results)
     # Normalise metrics 0‑1 for composite score
-    for col in ("youden_j", "calmar", "max_drawdown"):
+    norm_cols = []
+    for col in ("youden_j", "calmar", "max_drawdown", "max_dd"):
         if col not in df_res:
             continue
-        if col == "max_drawdown":
-            df_res[col + "_norm"] = 1 - (df_res[col] - df_res[col].min()) / (df_res[col].max() - df_res[col].min())
+        norm_col = col + "_norm"
+        norm_cols.append(norm_col)
+        if col == "max_drawdown" or col == "max_dd":
+            df_res[norm_col] = 1 - (df_res[col] - df_res[col].min()) / (df_res[col].max() - df_res[col].min())
         else:
-            df_res[col + "_norm"] = (df_res[col] - df_res[col].min()) / (df_res[col].max() - df_res[col].min())
+            df_res[norm_col] = (df_res[col] - df_res[col].min()) / (df_res[col].max() - df_res[col].min())
 
-    df_res["robustness_score"] = (
-        0.5 * df_res["youden_j_norm"] +
-        0.3 * df_res["calmar_norm"] +
-        0.2 * df_res["max_drawdown_norm"]
-    )
-    df_res.sort_values("robustness_score", ascending=False, inplace=True)
+    # Use available normalized columns for robustness_score
+    score_expr = []
+    if "youden_j_norm" in df_res:
+        score_expr.append("0.5 * df_res['youden_j_norm']")
+    if "calmar_norm" in df_res:
+        score_expr.append("0.3 * df_res['calmar_norm']")
+    if "max_drawdown_norm" in df_res:
+        score_expr.append("0.2 * df_res['max_drawdown_norm']")
+    elif "max_dd_norm" in df_res:
+        score_expr.append("0.2 * df_res['max_dd_norm']")
+    if score_expr:
+        df_res["robustness_score"] = eval(" + ".join(score_expr))
+        df_res.sort_values("robustness_score", ascending=False, inplace=True)
+    else:
+        log.warning("No normalized columns found for robustness_score calculation.")
 
     # Save & print
     out_f = Path("walk_forward_report.csv")
@@ -264,7 +292,7 @@ def parse_cli() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Adaptive MFV walk‑forward orchestrator")
     p.add_argument("--symbols", nargs="*", help="Override default symbols list")
     p.add_argument("--intervals", nargs="*", help="Override default intervals list")
-    p.add_argument("--max‑bars", type=int, help="Limit bars per dataset")
+    p.add_argument("--max_bars", type=int, help="Limit bars per dataset")
     p.add_argument("--debug", action="store_true", help="Verbose logging")
     return p.parse_args()
 

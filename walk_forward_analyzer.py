@@ -29,6 +29,7 @@ import json
 import logging
 import sys
 import time
+import traceback
 from pathlib import Path
 from typing import List, Tuple, Dict
 
@@ -146,14 +147,20 @@ def _mfv_z(vol: np.ndarray, close: np.ndarray, period: int) -> np.ndarray:
     """Rolling money‑flow volume z‑score for a given period (cached)."""
     key = period
     if key in _zcache:
-        return _zcache[key]
-    mfv = vol * np.sign(np.diff(np.concatenate(([close[0]], close))))
-    roll = _rolling_sum(mfv, period)
-    mean = pd.Series(roll).rolling(period).mean().to_numpy()
-    std = pd.Series(roll).rolling(period).std(ddof=0).to_numpy()
-    z = (roll - mean) / (std + 1e-12)
-    z = np.concatenate((np.zeros(period * 2 - 1), z))  # pad to same length
-    _zcache[key] = z
+        z = _zcache[key]
+    else:
+        mfv = vol * np.sign(np.diff(np.concatenate(([close[0]], close))))
+        roll = _rolling_sum(mfv, period)
+        mean = pd.Series(roll).rolling(period).mean().to_numpy()
+        std = pd.Series(roll).rolling(period).std(ddof=0).to_numpy()
+        z = (roll - mean) / (std + 1e-12)
+        z = np.concatenate((np.zeros(period * 2 - 1), z))  # pad to same length
+        _zcache[key] = z
+    # Ensure output is same length as close
+    if len(z) > len(close):
+        z = z[-len(close):]
+    elif len(z) < len(close):
+        z = np.concatenate((np.zeros(len(close) - len(z)), z))
     return z
 
 
@@ -188,7 +195,12 @@ def _evaluate_combo(periods: Tuple[int, int, int], df: pd.DataFrame) -> Tuple[fl
     vol = df["volume"].to_numpy(dtype=np.float64)
     close = df["close"].to_numpy(dtype=np.float64)
 
-    sig = _mfv_z(vol, close, periods[0]) + _mfv_z(vol, close, periods[1]) + _mfv_z(vol, close, periods[2])
+    z1 = _mfv_z(vol, close, periods[0])
+    z2 = _mfv_z(vol, close, periods[1])
+    z3 = _mfv_z(vol, close, periods[2])
+    minlen = min(len(z1), len(z2), len(z3), len(close))
+    z1, z2, z3, close = z1[-minlen:], z2[-minlen:], z3[-minlen:], close[-minlen:]
+    sig = z1 + z2 + z3
     signal = np.sign(sig)
 
     # Classification counts for J on next‑bar direction
@@ -315,30 +327,38 @@ def lockbox_validate(periods: Tuple[int, int, int], df_lock: pd.DataFrame) -> Di
 # ──────────────────────────────────────────────────────────────
 
 def _main(path: Path, symbol: str, interval: str):
-    t0 = time.time()
-    df = pd.read_csv(path)
-    for col in ("open", "high", "low", "close", "volume"):
-        if col not in df.columns:
-            raise ValueError(f"CSV missing column {col}")
+    try:
+        t0 = time.time()
+        df = pd.read_csv(path)
+        for col in ("open", "high", "low", "close", "volume"):
+            if col not in df.columns:
+                raise ValueError(f"CSV missing column {col}")
 
-    df_bench, df_tune, df_lock = _split_dataset(df)
-    best_p, tune_metrics = optimise(df_bench, df_tune)
-    lock_metrics = lockbox_validate(best_p, df_lock)
+        df_bench, df_tune, df_lock = _split_dataset(df)
+        best_p, tune_metrics = optimise(df_bench, df_tune)
+        lock_metrics = lockbox_validate(best_p, df_lock)
 
-    result = {
-        "status": "success",
-        "symbol": symbol,
-        "interval": interval,
-        "periods": best_p,
-        "tuning": tune_metrics,
-        "lockbox": lock_metrics,
-        "runtime_sec": round(time.time() - t0, 3),
-    }
-    json.dump(result, sys.stdout, separators=(",", ":"))
+        result = {
+            "status": "success",
+            "symbol": symbol,
+            "interval": interval,
+            "periods": best_p,
+            "tuning": tune_metrics,
+            "lockbox": lock_metrics,
+            "runtime_sec": round(time.time() - t0, 3),
+        }
+        # Always include 'data' key in output
+        if 'data' not in result:
+            result['data'] = {}
+        json.dump(result, sys.stdout, separators=(",", ":"))
+    except Exception as e:
+        logging.error(f'Exception in analyzer: {e}')
+        logging.error(traceback.format_exc())
+        sys.exit(1)
 
 
 if __name__ == "__main__":
     if len(sys.argv) != 4:
-        print("Usage: walk_forward_analyzer.py <csv_path> <symbol> <interval>", file=sys.stderr)
+        logging.error('Usage: walk_forward_analyzer.py <csv_path> <symbol> <interval>')
         sys.exit(1)
     _main(Path(sys.argv[1]), sys.argv[2], sys.argv[3])

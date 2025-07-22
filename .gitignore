@@ -4,3 +4,4 @@ comprehensive_report_robust.csv
 mfv_orchestrator.log
 *.csv
 /__pycache__
+*.parquet
